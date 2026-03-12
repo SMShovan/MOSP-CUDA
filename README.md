@@ -1,50 +1,116 @@
-# Instructions to run the code
+# MOSPCUDA
 
-## SYCL Project
+CUDA implementation of the Multi-Objective Shortest Path (MOSP) algorithm,
+ported from MOSPOpenMP. Uses CUDA kernels in place of OpenMP parallel regions.
 
-### Hellblender cluster dependency 
+## Requirements
 
-ssh \<toYourMachine\>
+- NVIDIA GPU with CUDA support
+- CUDA Toolkit (nvcc compiler)
+- C++17 compatible host compiler
 
-srun -p gpu --gres gpu:A100:1 -N 1 --ntasks-per-node 8 -t 02:00:00 --mem 200G --pty /bin/bash
+## Build
 
-module avail 
-module load cuda/11.8.0_gcc_9.5.0
-module load cmake/3.26.3_gcc_9.5.0
-module load miniconda3
-conda create -n sycl_env  (environment location: /home/akkcm/.conda/envs/sycl_env)
-source activate sycl_env
-python -m pip install ninja
-export DPCPP_HOME=~/sycl_workspace
-mkdir $DPCPP_HOME
-cd $DPCPP_HOME
-git clone https://github.com/intel/llvm -b sycl
-python $DPCPP_HOME/llvm/buildbot/configure.py --cudaexit
-python $DPCPP_HOME/llvm/buildbot/compile.py
+From the project root:
 
-Every time after openinng new window run below commands:
-export DPCPP_HOME=~/sycl_workspace && export PATH=$DPCPP_HOME/llvm/build/bin:$PATH && export LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib:$LD_LIBRARY_PATH && cd sycl_workspace/GPUMultiObjective/tools/
+```
+make
+```
 
+To specify a different CUDA architecture (default: sm_70):
 
-### Building the SYCL project and run
-clang++ -fsycl -fsycl-targets=nvptx64-nvidia-cuda SYCL_Final.cpp -o SYCL_Final && ./SYCL_Final
+```
+make CUDA_ARCH=sm_80
+```
 
-## OpenMP project
+## Run
 
-g++ -fopenmp -std=c++11 -o program main.cpp
+From the project root:
 
-## Base paper
+```
+./bin/main
+```
 
-### Clone the library
-git clone git@github.com:SMShovan/multicrit.git
+Or build and run in one step:
 
-### Source the libraries 
-source ../lib/tbb/bin/tbbvars.sh intel64
-### reflect changes
-make configure
-### make 
-make all
-### run scripts
-From scripts/ 
-run build_binaries.sh
+```
+make run
+```
 
+The app writes the output graph to:
+- `data/graph.mtx`
+- `data/originalGraph/graphCsrRowPtr.txt`
+- `data/originalGraph/graphCsrColInd.txt`
+- `data/originalGraph/graphCsrValues.txt`
+
+Then it applies `output/changedEdges/*.txt` changes and writes:
+- `data/updatedGraph/updatedGraphCsrRowPtr.txt`
+- `data/updatedGraph/updatedGraphCsrColInd.txt`
+- `data/updatedGraph/updatedGraphCsrValues.txt`
+
+Then it runs Dijkstra and writes original-graph results to:
+- `output/distancesTrees/distances.txt`
+- `output/distancesTrees/SSSPTree.txt`
+- `output/distancesTrees/distancesCsr.txt`
+- `output/distancesTrees/SSSPTreeCsr.txt`
+
+Then it runs Dijkstra on the updated CSR graph and writes:
+- `output/updatedDistancesTrees/updatedDistancesCsr.txt`
+- `output/updatedDistancesTrees/updatedSSSPTreeCsr.txt`
+
+Then it runs the Sequential SOSP Update algorithm (incremental update without
+recomputing Dijkstra from scratch) and writes:
+- `output/sospUpdateDistancesTrees/distancesCsr.txt`
+- `output/sospUpdateDistancesTrees/SSSPTreeCsr.txt`
+
+It also generates edge-change files:
+- `output/changedEdges/insert.txt`
+- `output/changedEdges/delete.txt`
+
+## Test Cases
+
+The app also generates 10 deterministic test cases under `tests/testCaseN/`, each containing:
+- `originalGraph/` (CSR files)
+- `changedEdges/` (insert.txt, delete.txt)
+- `updatedGraph/` (CSR files after applying changes)
+- `expected/` (ground truth distances and SSSP trees for original and updated graphs,
+  plus SOSP update algorithm output for comparison)
+
+These are seeded for reproducibility and vary across graph size, objective count,
+change ratio, and Dijkstra objective index.
+
+## Stress Tests
+
+### Sequential Stress Test
+
+```
+make stressTest
+./bin/stressTest
+```
+
+Runs 100 random graph configurations comparing sequential SOSP update against
+Dijkstra ground truth.
+
+### CUDA Parallel Stress Test
+
+```
+make parallelStressTest
+./bin/parallelStressTest
+```
+
+Runs 100 random graph configurations comparing the CUDA parallel SOSP update
+against Dijkstra ground truth.
+
+## Doxygen
+
+Generate docs from the project root:
+
+```
+doxygen Doxyfile
+```
+
+Open the HTML output:
+
+```
+open html/index.html
+```

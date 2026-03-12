@@ -1,0 +1,9 @@
+PROJECT_NAME           = "MOSPCUDA"
+OUTPUT_DIRECTORY       = .
+INPUT                  = src headers
+RECURSIVE              = YES
+FILE_PATTERNS          = *.cu *.cuh
+EXTRACT_ALL            = YES
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+QUIET                  = YES
