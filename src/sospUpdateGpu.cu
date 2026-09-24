@@ -51,7 +51,12 @@
  *
  * Packing: b = number of bits needed for the vertex ids plus a "no parent"
  * value; the remaining 64 - b bits hold the distance, and the all-ones word
- * is INF. The distance bound (n - 1) * maxWeight must fit (checked).
+ * is INF (b = 25 for road_usa, leaving 39 bits). If the distance bound
+ * (n - 1) * maxWeight does not fit in 64 - b bits (very large graphs or
+ * weights), the words hold the distance alone and the parents are
+ * recovered after the search: one pass over the out-edges gives every
+ * vertex the lowest id among its in-neighbours u with
+ * d[u] + w(u,v) == d[v] (sm_86 has no 128-bit atomics for a wider word).
  * ============================================================================
  */
 
@@ -85,12 +90,16 @@ constexpr int BLOCK_SIZE = 256;
     }                                                                          \
   } while (0)
 
-/// Packed (distance, parent) words.
+/// Packed (distance, parent) words; parentBits == 0 means distance only.
 struct Packing {
   int parentBits;
-  u64 noParent; // all-ones parent field
+  u64 noParent; // all-ones parent field (0 without parents)
 
+  __host__ __device__ bool hasParents() const { return parentBits > 0; }
   __host__ __device__ u64 pack(u64 distance, int parent) const {
+    if (parentBits == 0) {
+      return distance;
+    }
     return (distance << parentBits) |
            (parent < 0 ? noParent : static_cast<u64>(parent));
   }
@@ -103,12 +112,22 @@ struct Packing {
   u64 maxDistance() const { return (PACKED_INF >> parentBits) - 1; }
 };
 
-Packing makePacking(int numberOfNodes) {
+/// Largest distance representable in the output (finite distances must
+/// stay below DISTANCE_INF / 2).
+constexpr u64 OUTPUT_MAX_DISTANCE = static_cast<u64>(DISTANCE_INF / 2 - 1);
+
+/// Parent bits for n vertices, or distance-only words if the bound
+/// (n - 1) * maxWeight does not fit next to them.
+Packing makePacking(int numberOfNodes, u64 bound) {
   int bits = 1;
   while ((1ULL << bits) - 1 < static_cast<u64>(numberOfNodes)) {
     ++bits;
   }
-  return {bits, (1ULL << bits) - 1};
+  Packing packed{bits, (1ULL << bits) - 1};
+  if (bound <= packed.maxDistance()) {
+    return packed;
+  }
+  return Packing{0, 0};
 }
 
 /// Device-side control block of one update (initialized before launch).
@@ -439,14 +458,38 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
   }
 
   // ---- Unpack the result. ---------------------------------------------------
-  for (int v = tid; v < n; v += threads) {
-    u64 word = load(&p.packed[v]);
-    if (word == PACKED_INF) {
-      p.distances[v] = DISTANCE_INF;
-      p.parent[v] = -1;
-    } else {
-      p.distances[v] = static_cast<long long>(packing.distance(word));
-      p.parent[v] = packing.parent(word);
+  if (packing.hasParents()) {
+    for (int v = tid; v < n; v += threads) {
+      u64 word = load(&p.packed[v]);
+      if (word == PACKED_INF) {
+        p.distances[v] = DISTANCE_INF;
+        p.parent[v] = -1;
+      } else {
+        p.distances[v] = static_cast<long long>(packing.distance(word));
+        p.parent[v] = packing.parent(word);
+      }
+    }
+  } else {
+    // Distance-only words: recover the lowest-id parent over tight edges.
+    for (int v = tid; v < n; v += threads) {
+      u64 word = load(&p.packed[v]);
+      p.distances[v] = word == PACKED_INF ? DISTANCE_INF
+                                          : static_cast<long long>(word);
+      p.parent[v] = word == PACKED_INF || v == p.source ? -1 : INT_MAX;
+    }
+    grid.sync();
+    for (int u = tid; u < n; u += threads) {
+      u64 du = load(&p.packed[u]);
+      if (du == PACKED_INF) {
+        continue;
+      }
+      for (int e = p.out.rowPtr[u]; e < p.out.rowPtr[u + 1]; ++e) {
+        int w = p.out.colInd[e];
+        if (w != p.source &&
+            du + static_cast<u64>(p.out.weights[e]) == load(&p.packed[w])) {
+          atomicMin(&p.parent[w], u);
+        }
+      }
     }
   }
   if (tid == 0) {
@@ -593,6 +636,7 @@ bool runPersistent(Params &params, SospWorkspace &ws, SospStats &stats) {
   }
   ws.generation = max(ws.generation, result.generation);
   stats.invalidated = result.invalidated;
+  stats.packedParents = params.packing.hasParents();
   stats.jumpRounds = result.rounds;
   stats.iterations = result.iterations;
   stats.epochs = result.epochs;
@@ -600,14 +644,18 @@ bool runPersistent(Params &params, SospWorkspace &ws, SospStats &stats) {
   return true;
 }
 
-bool checkPacking(int n, long long maxWeight, const Packing &packing,
-                  u64 &bound) {
-  bound = static_cast<u64>(max(maxWeight, 1LL)) * static_cast<u64>(n - 1);
-  if (bound > packing.maxDistance()) {
-    cerr << "Error: distances up to " << bound << " do not fit the packed "
-         << (64 - packing.parentBits) << "-bit distance field.\n";
+/// Choose the packing for n vertices and the distance bound
+/// (n - 1) * maxWeight; fails only if distances could overflow 64 bits.
+bool choosePacking(int n, long long maxWeight, Params &params) {
+  const u64 weight = static_cast<u64>(max(maxWeight, 1LL));
+  const u64 hops = static_cast<u64>(max(n - 1, 1));
+  if (weight > OUTPUT_MAX_DISTANCE / hops) {
+    cerr << "Error: distances up to " << weight << " * " << hops
+         << " do not fit in 62 bits.\n";
     return false;
   }
+  params.maxDistance = weight * hops;
+  params.packing = makePacking(n, params.maxDistance);
   return true;
 }
 
@@ -628,8 +676,7 @@ bool sospUpdateGpu(const DeviceCsr &out, const DeviceCsr &in,
     return false;
   }
   Params params{};
-  params.packing = makePacking(n);
-  if (!checkPacking(n, maxWeight, params.packing, params.maxDistance)) {
+  if (!choosePacking(n, maxWeight, params)) {
     return false;
   }
   int rounds = 0;
@@ -663,8 +710,7 @@ bool sospFromScratchGpu(const DeviceCsr &out, int source, long long delta,
     return false;
   }
   Params params{};
-  params.packing = makePacking(n);
-  if (!checkPacking(n, maxWeight, params.packing, params.maxDistance)) {
+  if (!choosePacking(n, maxWeight, params)) {
     return false;
   }
   params.out = out;

@@ -16,7 +16,9 @@
  * re-weighting, targeted (thesis) and local batches. Graphs: random
  * directed graphs (the repository's generator) and road-like grids.
  *
- * Usage: mospTest [--seed S] [--work DIR]   (exit code 0 = all passed)
+ * Usage: mospTest [--seed S] [--work DIR] [--only GROUP]
+ *   GROUP: thesis-example, regressions, large-weights, generator, apply,
+ *          sosp (default: all). Exit code 0 = all checks passed.
  */
 
 #include "changeGenerator.cuh"
@@ -32,6 +34,7 @@
 #include "validation.cuh"
 
 #include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -587,6 +590,67 @@ void runRegressions(unsigned int) {
   cout << "regressions: " << cases.size() << " cases\n";
 }
 
+/// Large weights: (n - 1) * maxWeight does not fit next to the parent ids
+/// in a 64-bit word, so the GPU search keeps distances only and recovers
+/// the parents afterwards (the path used beyond ~2^25 vertices).
+void runLargeWeights(unsigned int seed) {
+  const int source = 0;
+  CsrGraph graph = gridGraph(320, 320, 2, INT_MAX, 0.1, seed * 13u + 5u);
+  int cases = 0;
+  for (bool safe : {true, false}) {
+    ChangeGeneratorOptions options;
+    options.numberOfChanges = 2000;
+    options.insertionPercentage = 50;
+    options.weightMax = INT_MAX;
+    options.seed = seed + (safe ? 1u : 2u);
+    options.safeDeletions = safe;
+    ChangeBatch batch;
+    generateChangeBatch(graph, options, batch);
+    string dir = g_work + "/large-weights-" + (safe ? "safe" : "unsafe");
+
+    // In-memory pipeline, plus a check that the fallback was used.
+    vector<long long> distances;
+    vector<int> parents;
+    for (int k = 0; k < 2; ++k) {
+      vector<long long> dist;
+      vector<int> parent;
+      dijkstraCsrGraph(graph, k, source, dist, parent);
+      distances.insert(distances.end(), dist.begin(), dist.end());
+      parents.insert(parents.end(), parent.begin(), parent.end());
+    }
+    ChangeBatch copy = batch;
+    MospOptions mospOptions;
+    CsrGraph updated;
+    MospResult result;
+    if (!mospUpdate(graph, copy, distances, parents, mospOptions, updated,
+                    result)) {
+      report("large-weights", false, dir + ": mospUpdate failed");
+      continue;
+    }
+    for (int k = 0; k < 2; ++k) {
+      report("large-weights", !result.objectiveStats[k].packedParents,
+             dir + ": expected the distance-only fallback");
+    }
+    checkPipeline(dir, graph, batch, source, {});
+
+    // File-based update on the same inputs.
+    CaseFiles files = writeCase(dir, graph, batch, source);
+    CsrGraph reverse;
+    transposeCsrGraph(updated, reverse);
+    auto parallel = [](const CaseFiles &f, int k, int s, const string &d,
+                       const string &t) {
+      string obj = f.init + "/obj" + to_string(k);
+      return parallelSOSPUpdate(f.graph, obj + "/distances.txt",
+                                obj + "/tree.txt", f.insert, f.remove, k, s, d,
+                                t);
+    };
+    runAndCheck("large-weights/parallel", parallel, files, updated, reverse,
+                source);
+    ++cases;
+  }
+  cout << "large-weights: " << cases << " cases (distance-only fallback)\n";
+}
+
 /// Uniform generator mode reproduces generateChangedEdges() exactly.
 void runGeneratorEquivalence(unsigned int seed) {
   int cases = 0;
@@ -658,13 +722,16 @@ void runApplyEquivalence(unsigned int seed) {
 
 int main(int argc, char **argv) {
   unsigned int seed = 1;
+  string only;
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
       seed = static_cast<unsigned int>(strtoul(argv[++i], nullptr, 10));
     } else if (!strcmp(argv[i], "--work") && i + 1 < argc) {
       g_work = argv[++i];
+    } else if (!strcmp(argv[i], "--only") && i + 1 < argc) {
+      only = argv[++i];
     } else {
-      cerr << "usage: mospTest [--seed S] [--work DIR]\n";
+      cerr << "usage: mospTest [--seed S] [--work DIR] [--only GROUP]\n";
       return 2;
     }
   }
@@ -687,11 +754,25 @@ int main(int argc, char **argv) {
       }
     }
   };
-  quiet(runThesisExample);
-  quiet(runRegressions);
-  quiet(runGeneratorEquivalence);
-  quiet(runApplyEquivalence);
-  quiet(runSosp);
+  const vector<pair<string, function<void(unsigned int)>>> groups = {
+      {"thesis-example", runThesisExample},
+      {"regressions", runRegressions},
+      {"large-weights", runLargeWeights},
+      {"generator", runGeneratorEquivalence},
+      {"apply", runApplyEquivalence},
+      {"sosp", runSosp},
+  };
+  bool ran = false;
+  for (const auto &group : groups) {
+    if (only.empty() || only == group.first) {
+      quiet(group.second);
+      ran = true;
+    }
+  }
+  if (!ran) {
+    cerr << "unknown group: " << only << "\n";
+    return 2;
+  }
 
   cout << (g_failures == 0 ? "=== mospTest: all checks passed ===\n"
                            : "=== mospTest: " + to_string(g_failures) +

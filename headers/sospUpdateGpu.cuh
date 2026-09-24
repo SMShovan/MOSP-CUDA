@@ -38,6 +38,10 @@ struct SospStats {
   int iterations = 0;   ///< near-far push iterations
   int epochs = 0;       ///< far-pile threshold increases
   long long pushes = 0; ///< vertex expansions
+  /// false: distances alone did not fit next to the parent ids, parents
+  /// were recovered after the search (graphs beyond ~2^25 vertices or
+  /// very large weights)
+  bool packedParents = true;
 };
 
 /**
