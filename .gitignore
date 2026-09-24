@@ -1,0 +1,19 @@
+# Build products
+/bin/
+/build/
+
+# Files written by bin/main, the stress tests and the test runner
+/data/
+/output/
+/tests/
+/stressTest/
+/parallelStressTest/
+/test-output/
+
+# Doxygen output
+/html/
+
+# Profiler reports
+*.nsys-rep
+*.ncu-rep
+*.sqlite
