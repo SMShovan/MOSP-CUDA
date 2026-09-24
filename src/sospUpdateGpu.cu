@@ -43,11 +43,17 @@
  * Control: everything above runs inside one cooperative kernel; the phases
  * are separated by grid-wide barriers and the loop decisions are taken on
  * the device, so an update costs one launch and one final copy of the
- * statistics instead of several host round trips per iteration. Counters
- * that are appended to in one phase and reset for a later one rotate over
- * three slots, which lets every push iteration and every pointer-jumping
- * round get by with a single grid barrier. Data written by other blocks is
- * read with __ldcg (L2), since L1 is not coherent within a kernel.
+ * statistics instead of several host round trips per iteration. Data written
+ * by other blocks is read with __ldcg (L2), since L1 is not coherent within
+ * a kernel.
+ *
+ * List appends (candidates, frontiers, far pile) reserve their slots with
+ * one warp-aggregated atomicAdd per group of converged threads
+ * (appendIndex). Without aggregation every push is a separate atomic on the
+ * same counter; a first version whose counter address the compiler could
+ * not prove warp-uniform (and therefore did not aggregate) was 30-55%
+ * slower on 50K batches (roadNet-CA 11.5 vs 7.9 ms, road_usa 127 vs 82 ms
+ * per objective).
  *
  * Packing: b = number of bits needed for the vertex ids plus a "no parent"
  * value; the remaining 64 - b bits hold the distance, and the all-ones word
@@ -134,7 +140,8 @@ Packing makePacking(int numberOfNodes, u64 bound) {
 struct Control {
   int listCount;     ///< candidates (invalidated + insert heads)
   int frontierCount; ///< vertices improved by the pull pass
-  int nearCount[3];  ///< near-frontier appends, rotating slots
+  int nearCount;     ///< size of the current near frontier
+  int nextCount;     ///< appends to the next near frontier
   int farCount;      ///< far pile size
   int far2Count;     ///< re-split far pile size
   int active[3];     ///< pointer jumping: a vertex still jumps
@@ -172,6 +179,17 @@ __device__ __forceinline__ u64 load(const u64 *p) { return __ldcg(p); }
 
 __device__ __forceinline__ bool claim(int *stamp, int v, int generation) {
   return atomicExch(&stamp[v], generation) != generation;
+}
+
+/// Reserve one slot of a shared list: one atomicAdd per group of converged
+/// threads (warp-aggregated), each thread gets its own index.
+__device__ __forceinline__ int appendIndex(int *counter) {
+  cg::coalesced_group active = cg::coalesced_threads();
+  int base = 0;
+  if (active.thread_rank() == 0) {
+    base = atomicAdd(counter, static_cast<int>(active.size()));
+  }
+  return active.shfl(base, 0) + static_cast<int>(active.thread_rank());
 }
 
 /// Warp-wide minimum of per-thread values, folded into *target.
@@ -273,7 +291,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
         p.flag[v] = 0; // leave the flags clean for the next update
         p.packed[v] = PACKED_INF;
         p.stamp[v] = generation;
-        p.candidates[atomicAdd(&c->listCount, 1)] = v;
+        p.candidates[appendIndex(&c->listCount)] = v;
       }
     }
     grid.sync();
@@ -283,7 +301,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     for (int i = tid; i < p.changes.numberOfInsertHeads; i += threads) {
       int v = p.changes.insertHeads[i];
       if (v != p.source && claim(p.stamp, v, generation)) {
-        p.candidates[atomicAdd(&c->listCount, 1)] = v;
+        p.candidates[appendIndex(&c->listCount)] = v;
       }
     }
     grid.sync();
@@ -309,7 +327,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
         u64 old = atomicMin(&p.packed[v], best);
         if (packing.distance(best) < packing.distance(old) &&
             claim(p.stamp, v, generation)) {
-          p.frontier[atomicAdd(&c->frontierCount, 1)] = v;
+          p.frontier[appendIndex(&c->frontierCount)] = v;
         }
       }
     }
@@ -331,47 +349,38 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
   const u64 smallest = load(&c->minimum);
   u64 threshold = (smallest == PACKED_INF ? 0 : smallest) + p.delta;
 
-  // Every phase that produces a near list appends to nearCount[phase % 3];
-  // at its start thread 0 zeroes the slot of the following phase, which was
-  // last used two phases ago and read by everybody before the previous
-  // barrier.
-  int phase = 0;
+  // The current near frontier has c->nearCount entries; a push iteration
+  // appends the next one (c->nextCount) and thread 0 moves the count over
+  // between two barriers.
   int *current = p.nearA, *next = p.nearB, *far = p.farA, *far2 = p.farB;
   ++generation;
-  if (tid == 0) {
-    c->nearCount[1] = 0;
-  }
   for (int i = tid; i < frontierCount; i += threads) {
     int v = load(&p.frontier[i]);
     u64 word = load(&p.packed[v]);
     u64 d = word == PACKED_INF ? PACKED_INF : packing.distance(word);
     if (d < threshold) {
       if (claim(p.stamp, v, generation)) {
-        current[atomicAdd(&c->nearCount[0], 1)] = v;
+        current[appendIndex(&c->nearCount)] = v;
       }
     } else if (atomicExch(&p.inFar[v], 1) == 0) {
-      far[atomicAdd(&c->farCount, 1)] = v;
+      far[appendIndex(&c->farCount)] = v;
     }
   }
   grid.sync();
   if (tid == 0) {
     c->minimum = PACKED_INF; // everybody read it before the barrier
   }
-  int nearCount = load(&c->nearCount[0]);
+  grid.sync();
   int iterations = 0, epochs = 0;
   long long pushes = 0;
 
   while (true) {
+    const int nearCount = load(&c->nearCount);
     if (nearCount > 0) {
       // -- One push iteration over the near frontier. --
-      ++phase;
       ++generation;
       ++iterations;
       pushes += nearCount;
-      if (tid == 0) {
-        c->nearCount[(phase + 1) % 3] = 0;
-      }
-      int *slot = &c->nearCount[phase % 3];
       for (int i = tid; i < nearCount; i += threads) {
         int u = load(&current[i]);
         u64 word = load(&p.packed[u]);
@@ -393,16 +402,20 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
           if (nd < packing.distance(old)) {
             if (nd < threshold) {
               if (claim(p.stamp, w, generation)) {
-                next[atomicAdd(slot, 1)] = w;
+                next[appendIndex(&c->nextCount)] = w;
               }
             } else if (atomicExch(&p.inFar[w], 1) == 0) {
-              far[atomicAdd(&c->farCount, 1)] = w;
+              far[appendIndex(&c->farCount)] = w;
             }
           }
         }
       }
       grid.sync();
-      nearCount = load(slot);
+      if (tid == 0) {
+        c->nearCount = load(&c->nextCount);
+        c->nextCount = 0;
+      }
+      grid.sync();
       int *t = current;
       current = next;
       next = t;
@@ -425,12 +438,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     minimumInto(local, &c->minimum);
     grid.sync();
     threshold = max(threshold, load(&c->minimum)) + p.delta;
-    ++phase;
     ++generation;
-    if (tid == 0) {
-      c->nearCount[(phase + 1) % 3] = 0;
-    }
-    int *slot = &c->nearCount[phase % 3];
     for (int i = tid; i < farCount; i += threads) {
       int v = load(&far[i]);
       u64 word = load(&p.packed[v]);
@@ -438,23 +446,22 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
       if (d < threshold) {
         p.inFar[v] = 0;
         if (claim(p.stamp, v, generation)) {
-          current[atomicAdd(slot, 1)] = v;
+          current[appendIndex(&c->nearCount)] = v;
         }
       } else {
-        far2[atomicAdd(&c->far2Count, 1)] = v;
+        far2[appendIndex(&c->far2Count)] = v;
       }
     }
     grid.sync();
-    nearCount = load(slot);
     if (tid == 0) {
       c->farCount = load(&c->far2Count);
       c->far2Count = 0;
       c->minimum = PACKED_INF;
     }
+    grid.sync();
     int *t = far;
     far = far2;
     far2 = t;
-    grid.sync(); // farCount is updated before the next push appends to it
   }
 
   // ---- Unpack the result. ---------------------------------------------------

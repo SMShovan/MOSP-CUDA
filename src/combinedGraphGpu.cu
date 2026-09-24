@@ -75,23 +75,28 @@ __device__ __forceinline__ bool combinedEdge(const int *parents, int n, int K,
 }
 
 /// Pass 1: out-degree of every parent, number of edges and weight sum.
+/// The two totals are reduced per warp first: one atomic per thread on the
+/// same two counters serializes (tens of ms at n = 24M).
 __global__ void countEdgesKernel(const int *parents, int n, int K, int source,
                                  const int *prefTerms, int base, int *degree,
                                  unsigned long long *sums) {
   int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v >= n || v == source) {
-    return;
-  }
   unsigned long long edges = 0, weightSum = 0;
-  for (int k = 0; k < K; ++k) {
-    int p, weight;
-    if (combinedEdge(parents, n, K, v, k, prefTerms, base, p, weight)) {
-      atomicAdd(&degree[p], 1);
-      ++edges;
-      weightSum += static_cast<unsigned long long>(weight);
+  if (v < n && v != source) {
+    for (int k = 0; k < K; ++k) {
+      int p, weight;
+      if (combinedEdge(parents, n, K, v, k, prefTerms, base, p, weight)) {
+        atomicAdd(&degree[p], 1);
+        ++edges;
+        weightSum += static_cast<unsigned long long>(weight);
+      }
     }
   }
-  if (edges > 0) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    edges += __shfl_down_sync(0xffffffffu, edges, offset);
+    weightSum += __shfl_down_sync(0xffffffffu, weightSum, offset);
+  }
+  if ((threadIdx.x & 31) == 0 && edges > 0) {
     atomicAdd(&sums[0], edges);
     atomicAdd(&sums[1], weightSum);
   }
