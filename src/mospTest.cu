@@ -24,6 +24,7 @@
 #include "dijkstra.cuh"
 #include "generateChangedEdges.cuh"
 #include "generateGraphCSR.cuh"
+#include "mospUpdate.cuh"
 #include "parallelCombinedGraph.cuh"
 #include "parallelSOSPUpdate.cuh"
 #include "sequentialSOSPUpdate.cuh"
@@ -236,6 +237,59 @@ void checkDeterminism(const CaseFiles &files, const string &firstLabel, int n,
   }
 }
 
+/// The in-memory pipeline (mospUpdate): every tree and the MOSP tree must
+/// equal the host references exactly.
+void checkPipeline(const string &dir, const CsrGraph &graph,
+                   const ChangeBatch &input, int source,
+                   const vector<int> &pref) {
+  const int n = graph.numberOfNodes, K = graph.numberOfObjectives;
+  vector<long long> distances;
+  vector<int> parents;
+  for (int k = 0; k < K; ++k) {
+    vector<long long> dist;
+    vector<int> parent;
+    dijkstraCsrGraph(graph, k, source, dist, parent);
+    distances.insert(distances.end(), dist.begin(), dist.end());
+    parents.insert(parents.end(), parent.begin(), parent.end());
+  }
+  ChangeBatch batch = input;
+  MospOptions options;
+  options.source = source;
+  options.preferences = pref;
+  CsrGraph updated, reverse;
+  MospResult result;
+  if (!mospUpdate(graph, batch, distances, parents, options, updated,
+                  result)) {
+    report("pipeline", false, dir + ": mospUpdate failed");
+    return;
+  }
+  transposeCsrGraph(updated, reverse);
+  for (int k = 0; k < K; ++k) {
+    vector<long long> refDist;
+    vector<int> refParent;
+    dijkstraCsrGraph(updated, k, source, refDist, refParent);
+    vector<long long> dist(result.distances.begin() + static_cast<size_t>(k) * n,
+                           result.distances.begin() + static_cast<size_t>(k + 1) * n);
+    vector<int> parent(result.parents.begin() + static_cast<size_t>(k) * n,
+                       result.parents.begin() + static_cast<size_t>(k + 1) * n);
+    TreeCheck check =
+        checkSospTree(reverse, k, source, dist, parent, refDist, &refParent);
+    report("pipeline", check.ok(true),
+           dir + " obj" + to_string(k) + ": " + check.summary());
+  }
+  CsrGraph combined =
+      combinedGraphReference(result.parents, n, K, source, pref);
+  CsrGraph combinedReverse;
+  transposeCsrGraph(combined, combinedReverse);
+  vector<long long> refDist;
+  vector<int> refParent;
+  dijkstraCsrGraph(combined, 0, source, refDist, refParent);
+  TreeCheck check =
+      checkSospTree(combinedReverse, 0, source, result.combinedDistances,
+                    result.combinedParent, refDist, &refParent);
+  report("pipeline", check.ok(true), dir + " combined: " + check.summary());
+}
+
 struct ChangeSet {
   string name;
   ChangeGeneratorOptions options;
@@ -365,6 +419,9 @@ void runSosp(unsigned int seed) {
                     reverse, source);
         checkDeterminism(files, "parallel/" + set.name, graph.numberOfNodes,
                          graph.numberOfObjectives, source);
+        vector<int> skewedPref(graph.numberOfObjectives, 2);
+        skewedPref[0] = 1;
+        checkPipeline(dir, graph, batch, source, rep == 0 ? vector<int>() : skewedPref);
         if (static_cast<int>(trees.size()) == graph.numberOfObjectives) {
           // Default Pref (all 1s) and a skewed Pref = (K+1, 1, K+1, ...).
           checkCombined(files, trees, graph.numberOfNodes, source, {});
@@ -376,7 +433,7 @@ void runSosp(unsigned int seed) {
       }
     }
   }
-  cout << "sosp: " << cases << " cases (parallel, sequential, combined)\n";
+  cout << "sosp: " << cases << " cases (parallel, sequential, combined, pipeline)\n";
 }
 
 /// The worked example of thesis Ch. 4 (Fig. "Finding a single MOSP"):

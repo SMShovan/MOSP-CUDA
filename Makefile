@@ -19,7 +19,8 @@ APP      := $(BINDIR)/main
 # Base sources (shared by all targets)
 BASE_SRCS := $(SRCDIR)/generateGraph.cu $(SRCDIR)/generateGraphCSR.cu $(SRCDIR)/generateChangedEdges.cu $(SRCDIR)/updateGraphCSR.cu $(SRCDIR)/generateTestCases.cu $(SRCDIR)/Dijkstra.cu $(SRCDIR)/read.cu \
              $(SRCDIR)/csrGraph.cu $(SRCDIR)/stageTimer.cu $(SRCDIR)/validation.cu \
-             $(SRCDIR)/changeGenerator.cu $(SRCDIR)/sospUpdateGpu.cu $(SRCDIR)/combinedGraphGpu.cu
+             $(SRCDIR)/changeGenerator.cu $(SRCDIR)/sospUpdateGpu.cu $(SRCDIR)/combinedGraphGpu.cu \
+             $(SRCDIR)/deviceGraph.cu $(SRCDIR)/mospUpdate.cu
 
 # Main application (includes sequential SOSP update)
 MAIN_SRCS := $(SRCDIR)/main.cu $(BASE_SRCS) $(SRCDIR)/sequentialSOSPUpdate.cu $(SRCDIR)/parallelSOSPUpdate.cu $(SRCDIR)/parallelCombinedGraph.cu
