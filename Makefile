@@ -33,6 +33,10 @@ STRESS_OBJS := $(STRESS_SRCS:$(SRCDIR)/%.cu=$(BUILDDIR)/%.o)
 PARALLEL_STRESS_SRCS := $(SRCDIR)/parallelStressTest.cu $(BASE_SRCS) $(SRCDIR)/parallelSOSPUpdate.cu $(SRCDIR)/sequentialSOSPUpdate.cu
 PARALLEL_STRESS_OBJS := $(PARALLEL_STRESS_SRCS:$(SRCDIR)/%.cu=$(BUILDDIR)/%.o)
 
+# Oracle tests (new change sets, combined graph, generator/apply checks)
+TEST_SRCS := $(SRCDIR)/mospTest.cu $(BASE_SRCS) $(SRCDIR)/sequentialSOSPUpdate.cu $(SRCDIR)/parallelSOSPUpdate.cu $(SRCDIR)/parallelCombinedGraph.cu
+TEST_OBJS := $(TEST_SRCS:$(SRCDIR)/%.cu=$(BUILDDIR)/%.o)
+
 # Input preparation tool
 PREP_SRCS := $(SRCDIR)/mospPrep.cu $(SRCDIR)/changeGenerator.cu $(SRCDIR)/csrGraph.cu $(SRCDIR)/Dijkstra.cu $(SRCDIR)/read.cu
 PREP_OBJS := $(PREP_SRCS:$(SRCDIR)/%.cu=$(BUILDDIR)/%.o)
@@ -64,6 +68,9 @@ $(BINDIR)/mosp: $(MOSP_OBJS) | $(BINDIR)
 	$(NVCC) $(CXXFLAGS) $(NVFLAGS) -o $@ $^
 
 $(BINDIR)/mospPrep: $(PREP_OBJS) | $(BINDIR)
+	$(NVCC) $(CXXFLAGS) $(NVFLAGS) -o $@ $^
+
+$(BINDIR)/mospTest: $(TEST_OBJS) | $(BINDIR)
 	$(NVCC) $(CXXFLAGS) $(NVFLAGS) -o $@ $^
 
 # --- Sequential stress test ---
