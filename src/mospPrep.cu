@@ -327,7 +327,8 @@ int main(int argc, char **argv) {
     rc = widen(argv[2], argv[3], K, wmin, wmax, seed);
   } else if (command == "cache" && argc == 4) {
     CsrGraph graph;
-    rc = readCsrGraph(argv[2], graph) && saveCsrGraphBinary(argv[3], graph)
+    rc = readCsrGraph(argv[2], graph) &&
+                 saveCsrGraphBinary(argv[3], graph, argv[2])
              ? 0
              : 1;
   } else if (command == "changes" && argc >= 4) {

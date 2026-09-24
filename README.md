@@ -81,7 +81,8 @@ mosp --graph <csrPrefix> --changes <dir> --init <dir> [options]
                      --init trees (mospPrep init --source s)
   --pref p1,..,pK    preference vector (default all 1s; lower = higher priority)
   --delta D          near-far bucket width (default 32 * avg weight / avg degree)
-  --cache file       binary cache of the graph (written if missing or stale)
+  --cache file       binary cache of the graph (rebuilt unless it was made
+                     from these text files, same path, sizes and mtimes)
   --canonicalize     normalize initial trees from other tools to the tie rule
   --out dir          output directory; --no-output to skip writing
   --validate         check all trees against host Dijkstra

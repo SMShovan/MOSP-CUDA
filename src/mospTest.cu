@@ -18,8 +18,8 @@
  *
  * Usage: mospTest [--seed S] [--work DIR] [--only GROUP]
  *   GROUP: thesis-example, regressions, large-weights, packing-boundary,
- *          input-validation, generator, apply, sosp (default: all). Exit
- *          code 0 = all checks passed.
+ *          input-validation, binary-cache, generator, apply, sosp
+ *          (default: all). Exit code 0 = all checks passed.
  */
 
 #include "changeGenerator.cuh"
@@ -874,6 +874,70 @@ void runInputValidation(unsigned int) {
   cout << "input-validation: " << cases << " cases\n";
 }
 
+/// The binary cache is used only for the text graph it was made from: not
+/// for another graph with the same shape, not after the text files
+/// changed (even to an older mtime), and not if its arrays are corrupt.
+void runBinaryCache(unsigned int seed) {
+  const string dir = g_work + "/binary-cache";
+  const string a = dir + "/a/graphCsr", b = dir + "/b/graphCsr";
+  const string cache = dir + "/cache.bin";
+  CsrGraph graphA = gridGraph(6, 5, 2, 40, 0.1, seed * 3u + 1u);
+  CsrGraph graphB = graphA; // same topology, other weights
+  for (int &w : graphB.weights) {
+    w = w % 7 + 1;
+  }
+  writeCsrGraph(a, graphA);
+  writeCsrGraph(b, graphB);
+  int cases = 0;
+  auto sameGraph = [](const CsrGraph &x, const CsrGraph &y) {
+    return x.numberOfNodes == y.numberOfNodes &&
+           x.numberOfObjectives == y.numberOfObjectives &&
+           x.rowPtr == y.rowPtr && x.colInd == y.colInd &&
+           x.weights == y.weights;
+  };
+  auto check = [&](const string &label, const string &prefix,
+                   bool expectCacheUsed, const CsrGraph &expected) {
+    CsrGraph fromCache, loaded;
+    const bool used = loadCsrGraphBinary(cache, fromCache, prefix);
+    report("binary-cache", used == expectCacheUsed,
+           label + (expectCacheUsed ? ": cache not used" : ": cache used"));
+    report("binary-cache",
+           loadCsrGraph(prefix, loaded, cache) && sameGraph(loaded, expected),
+           label + ": loadCsrGraph returned the wrong graph");
+    ++cases;
+  };
+  filesystem::remove(cache);
+  check("no cache yet", a, false, graphA);   // writes the cache for a
+  check("cache of a", a, true, graphA);
+  check("a's cache for b", b, false, graphB); // rebuilds it for b
+  check("cache of b", b, true, graphB);
+  // b rewritten (same bytes, then other weights) with an older mtime.
+  const auto values = b + "Values.txt";
+  auto rewrite = [&](const CsrGraph &graph) {
+    const auto before = filesystem::last_write_time(values);
+    writeCsrGraph(b, graph);
+    filesystem::last_write_time(values, before - chrono::hours(24 * 365));
+  };
+  rewrite(graphB);
+  check("b rewritten, older mtime", b, false, graphB);
+  rewrite(graphA);
+  check("b changed, older mtime", b, false, graphA);
+  // A corrupt column index behind a valid identity is rejected.
+  {
+    fstream file(cache, ios::in | ios::out | ios::binary);
+    file.seekp(-static_cast<streamoff>(graphA.weights.size() * sizeof(int) +
+                                       sizeof(int)),
+               ios::end);
+    const int bad = graphA.numberOfNodes + 5;
+    file.write(reinterpret_cast<const char *>(&bad), sizeof(bad));
+  }
+  CsrGraph corrupt;
+  report("binary-cache", !loadCsrGraphBinary(cache, corrupt, b),
+         "cache with a column index out of range accepted");
+  ++cases;
+  cout << "binary-cache: " << cases << " cases\n";
+}
+
 /// Uniform generator mode reproduces generateChangedEdges() exactly.
 void runGeneratorEquivalence(unsigned int seed) {
   int cases = 0;
@@ -983,6 +1047,7 @@ int main(int argc, char **argv) {
       {"large-weights", runLargeWeights},
       {"packing-boundary", runPackingBoundary},
       {"input-validation", runInputValidation},
+      {"binary-cache", runBinaryCache},
       {"generator", runGeneratorEquivalence},
       {"apply", runApplyEquivalence},
       {"sosp", runSosp},

@@ -63,19 +63,41 @@ bool readCsrGraph(const std::string &prefix, CsrGraph &graph);
 /** @brief Write a graph in the same three-file text format. */
 bool writeCsrGraph(const std::string &prefix, const CsrGraph &graph);
 
-/** @brief Save a graph as one binary file (a cache of the text format). */
-bool saveCsrGraphBinary(const std::string &path, const CsrGraph &graph);
+/**
+ * @brief Save a graph as one binary file, a cache of the text graph at
+ *        @p sourcePrefix.
+ *
+ * @details
+ * The file records the identity of its source: the canonical path of
+ * @p sourcePrefix and the size and modification time (nanoseconds) of the
+ * three text files, taken when the cache is written.
+ */
+bool saveCsrGraphBinary(const std::string &path, const CsrGraph &graph,
+                        const std::string &sourcePrefix);
 
-/** @brief Load a graph written by saveCsrGraphBinary(). */
-bool loadCsrGraphBinary(const std::string &path, CsrGraph &graph);
+/**
+ * @brief Load a graph written by saveCsrGraphBinary() for the text graph
+ *        at @p sourcePrefix.
+ *
+ * @details
+ * Fails (without a message) if the file is missing, truncated or of an
+ * older format, if its recorded identity differs from the current text
+ * files at @p sourcePrefix (another graph, or files changed or copied
+ * since), or if the arrays are not a valid CSR graph (row pointers from 0,
+ * monotone, ending at m; column indices in [0, n); weights in
+ * [1, INT_MAX]).
+ */
+bool loadCsrGraphBinary(const std::string &path, CsrGraph &graph,
+                        const std::string &sourcePrefix);
 
 /**
  * @brief Load a text CSR graph, optionally through a binary cache.
  *
  * @details
- * With a non-empty @p cachePath the binary file is used when it exists and
- * is newer than the three text files; otherwise the text is parsed and the
- * cache is (re)written.
+ * With a non-empty @p cachePath the binary file is used when
+ * loadCsrGraphBinary() accepts it for @p prefix; otherwise the text is
+ * parsed and the cache is (re)written, with a notice if a cache file was
+ * there but did not match.
  */
 bool loadCsrGraph(const std::string &prefix, CsrGraph &graph,
                   const std::string &cachePath = "");

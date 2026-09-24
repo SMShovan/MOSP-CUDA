@@ -17,7 +17,8 @@
  *                      lower value = higher priority, thesis Ch. 4 Step 2)
  *   --delta <D>        near-far bucket width (default: 32 * average weight /
  *                      average out-degree, per objective)
- *   --cache <file>     binary cache of the graph (written if missing/stale)
+ *   --cache <file>     binary cache of the graph (rebuilt unless it was made
+ *                      from these text files: same path, sizes, mtimes)
  *   --canonicalize     normalize the initial trees to the lowest-id tie rule
  *                      (for trees from other tools; not timed)
  *   --out <dir>        output directory (default mosp-output)
