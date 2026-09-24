@@ -18,8 +18,8 @@
  *
  * Usage: mospTest [--seed S] [--work DIR] [--only GROUP]
  *   GROUP: thesis-example, regressions, large-weights, packing-boundary,
- *          generator, apply, sosp (default: all). Exit code 0 = all checks
- *          passed.
+ *          input-validation, generator, apply, sosp (default: all). Exit
+ *          code 0 = all checks passed.
  */
 
 #include "changeGenerator.cuh"
@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <random>
@@ -769,6 +770,110 @@ void runPackingBoundary(unsigned int) {
   cout << "packing-boundary: " << ran << " cases\n";
 }
 
+void writeText(const string &path, const string &text) {
+  filesystem::create_directories(filesystem::path(path).parent_path());
+  ofstream(path) << text;
+}
+
+/// The readers and mospUpdate reject invalid inputs instead of running on
+/// them: weights outside [1, INT_MAX] (graph and inserts), ids or offsets
+/// that do not fit an int, incomplete or duplicated distance and tree
+/// files, negative distances, and initial trees of another source. Each
+/// case differs from a valid input (accepted, checked first) in one value.
+void runInputValidation(unsigned int) {
+  const string dir = g_work + "/input-validation";
+  int cases = 0;
+  // Graph 0 -> 1 -> 2 with K = 2.
+  auto graphAccepted = [&](const string &rows, const string &values) {
+    const string prefix = dir + "/g" + to_string(cases++) + "/graphCsr";
+    writeText(prefix + "RowPtr.txt", rows);
+    writeText(prefix + "ColInd.txt", "1\n2\n");
+    writeText(prefix + "Values.txt", values);
+    CsrGraph graph;
+    return readCsrGraph(prefix, graph);
+  };
+  const string rows = "0\n1\n2\n2\n";
+  report("input-validation", graphAccepted(rows, "4 5\n2147483647 7\n"),
+         "valid graph rejected");
+  for (const string &values : {"0 5\n2 7\n", "4 5\n-3 7\n",
+                               "4294967297 5\n2 7\n", "4 5\n2147483648 7\n"}) {
+    report("input-validation", !graphAccepted(rows, values),
+           "graph with weights '" + values + "' accepted");
+  }
+  report("input-validation",
+         !graphAccepted("0\n1\n4294967298\n2\n", "4 5\n2 7\n"),
+         "row pointer above INT_MAX accepted");
+
+  auto batchAccepted = [&](const string &insert) {
+    const string changes = dir + "/c" + to_string(cases++);
+    writeText(changes + "/insert.txt", insert);
+    writeText(changes + "/delete.txt", "0 1\n");
+    ChangeBatch batch;
+    return readChangeBatch(changes + "/insert.txt", changes + "/delete.txt",
+                           2, 3, batch);
+  };
+  report("input-validation", batchAccepted("2 0 1 2147483647\n"),
+         "valid batch rejected");
+  for (const string &insert : {"2 0 0 3\n", "2 0 -5 3\n",
+                               "2 0 4294967297 3\n", "2 3 1 1\n"}) {
+    report("input-validation", !batchAccepted(insert),
+           "insert line '" + insert + "' accepted");
+  }
+
+  auto distancesAccepted = [&](const string &text) {
+    const string path = dir + "/d" + to_string(cases++) + ".txt";
+    writeText(path, text);
+    vector<long long> distances;
+    return readDistances(path, 3, distances);
+  };
+  auto parentsAccepted = [&](const string &text) {
+    const string path = dir + "/p" + to_string(cases++) + ".txt";
+    writeText(path, text);
+    vector<int> parents;
+    return readParents(path, 3, parents);
+  };
+  report("input-validation", distancesAccepted("0 0\n1 4\n2 INF\n"),
+         "valid distances rejected");
+  report("input-validation", parentsAccepted("0 -1\n1 0\n2 -1\n"),
+         "valid tree rejected");
+  for (const string &text : {"0 0\n1 4\n", "0 0\n1 4\n1 4\n2 6\n",
+                             "0 0\n1 -4\n2 6\n"}) {
+    report("input-validation", !distancesAccepted(text),
+           "distances '" + text + "' accepted");
+  }
+  for (const string &text : {"0 -1\n1 0\n", "0 -1\n1 0\n1 0\n2 1\n"}) {
+    report("input-validation", !parentsAccepted(text),
+           "tree '" + text + "' accepted");
+  }
+
+  // Trees of source 0 used with source 1.
+  CsrGraph graph = gridGraph(4, 4, 2, 9, 0.0, 7);
+  vector<long long> distances;
+  vector<int> parents;
+  for (int k = 0; k < 2; ++k) {
+    vector<long long> dist;
+    vector<int> parent;
+    dijkstraCsrGraph(graph, k, 0, dist, parent);
+    distances.insert(distances.end(), dist.begin(), dist.end());
+    parents.insert(parents.end(), parent.begin(), parent.end());
+  }
+  for (int source : {0, 1}) {
+    ChangeBatch batch;
+    batch.numberOfObjectives = 2;
+    MospOptions options;
+    options.source = source;
+    CsrGraph updated;
+    MospResult result;
+    const bool ok =
+        mospUpdate(graph, batch, distances, parents, options, updated, result);
+    report("input-validation", ok == (source == 0),
+           source == 0 ? "mospUpdate rejected trees of its source"
+                       : "mospUpdate accepted trees of another source");
+    ++cases;
+  }
+  cout << "input-validation: " << cases << " cases\n";
+}
+
 /// Uniform generator mode reproduces generateChangedEdges() exactly.
 void runGeneratorEquivalence(unsigned int seed) {
   int cases = 0;
@@ -877,6 +982,7 @@ int main(int argc, char **argv) {
       {"regressions", runRegressions},
       {"large-weights", runLargeWeights},
       {"packing-boundary", runPackingBoundary},
+      {"input-validation", runInputValidation},
       {"generator", runGeneratorEquivalence},
       {"apply", runApplyEquivalence},
       {"sosp", runSosp},

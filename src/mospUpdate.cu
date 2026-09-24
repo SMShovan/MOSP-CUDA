@@ -72,6 +72,24 @@ bool mospUpdate(const CsrGraph &original, ChangeBatch &batch,
     cerr << "Error: invalid MOSP update input.\n";
     return false;
   }
+  // The initial trees must be rooted at the source (e.g. `mospPrep init
+  // --source` and `mosp --source` must agree).
+  for (int k = 0; k < K; ++k) {
+    const size_t at = static_cast<size_t>(k) * n + options.source;
+    if (initialDistances[at] != 0 || initialParents[at] != -1) {
+      cerr << "Error: the initial tree of objective " << k
+           << " is not rooted at the source " << options.source
+           << " (its distance is ";
+      if (initialDistances[at] >= DISTANCE_INF / 2) {
+        cerr << "INF";
+      } else {
+        cerr << initialDistances[at];
+      }
+      cerr << ", its parent " << initialParents[at]
+           << "); compute the trees for this source.\n";
+      return false;
+    }
+  }
 
   // --- Apply the batch once (host) ------------------------------------------
   auto start = chrono::steady_clock::now();

@@ -649,7 +649,8 @@ bool runPersistent(Params &params, SospWorkspace &ws, SospStats &stats) {
   GPU_CHECK(cudaStreamSynchronize(0));
   const Control &result = *static_cast<const Control *>(ws.hostControl);
   if (result.overflow) {
-    cerr << "Error: an input distance does not fit the packed format.\n";
+    cerr << "Error: an input distance is negative or larger than (n - 1) * "
+            "maxWeight; the initial tree does not belong to this graph.\n";
     return false;
   }
   ws.generation = max(ws.generation, result.generation);

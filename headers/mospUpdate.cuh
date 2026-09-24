@@ -61,7 +61,9 @@ struct MospResult {
  * @param batch              The batch (weightIncreaseMask is filled).
  * @param initialDistances   K * n initial distances (objective-major).
  * @param initialParents     K * n initial parents (objective-major); ties
- *                           broken by the lowest parent id.
+ *                           broken by the lowest parent id. Every tree
+ *                           must be rooted at options.source (distance 0,
+ *                           parent -1), otherwise the call fails.
  * @param updated            Output: the updated graph (host copy).
  */
 bool mospUpdate(const CsrGraph &original, ChangeBatch &batch,

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -115,7 +116,8 @@ private:
 class TextScanner {
 public:
   explicit TextScanner(const string &text)
-      : pos_(text.data()), end_(text.data() + text.size()) {}
+      : begin_(text.data()), pos_(text.data()),
+        end_(text.data() + text.size()) {}
 
   /// Skip spaces, tabs and carriage returns (not newlines).
   void skipBlanks() {
@@ -139,6 +141,10 @@ public:
            memcmp(pos_, word, len) == 0;
   }
   void skip(size_t count) { pos_ += count; }
+  /// 1-based line number of the current position (for error messages).
+  long long line() const {
+    return 1 + static_cast<long long>(count(begin_, pos_, '\n'));
+  }
 
   /// Parse a (possibly negative) integer at the current position.
   bool readInt(long long &value) {
@@ -151,14 +157,22 @@ public:
   }
 
 private:
+  const char *begin_;
   const char *pos_;
   const char *end_;
 };
 
-/// Parse a file of whitespace-separated integers.
-bool readIntFile(const string &path, vector<int> &values) {
+/// "<path>:<line>" for error messages.
+string where(const string &path, const TextScanner &scanner) {
+  return path + ":" + to_string(scanner.line());
+}
+
+/// Parse a file of whitespace-separated integers in [0, INT_MAX] (vertex
+/// ids and edge offsets).
+bool readIntFile(const string &path, vector<int> &values, string &error) {
   string text;
   if (!readWholeFile(path, text)) {
+    error = "could not read " + path;
     return false;
   }
   TextScanner scanner(text);
@@ -167,12 +181,27 @@ bool readIntFile(const string &path, vector<int> &values) {
   scanner.skipWhitespace();
   while (!scanner.atEnd()) {
     if (!scanner.readInt(value)) {
+      error = "invalid token at " + where(path, scanner);
+      return false;
+    }
+    if (value < 0 || value > INT_MAX) {
+      error = "value " + to_string(value) + " out of range [0, " +
+              to_string(INT_MAX) + "] at " + where(path, scanner);
       return false;
     }
     values.push_back(static_cast<int>(value));
     scanner.skipWhitespace();
   }
   return true;
+}
+
+/// Edge weights must be integers in [1, INT_MAX] (the SOSP engines need
+/// positive weights and store them in 32 bits).
+bool validWeight(long long value) { return value >= 1 && value <= INT_MAX; }
+
+string weightError(long long value, const string &location) {
+  return "weight " + to_string(value) + " out of range [1, " +
+         to_string(INT_MAX) + "] at " + location;
 }
 
 bool fileIsNewer(const string &a, const string &b) {
@@ -197,7 +226,7 @@ bool readValuesFile(const string &path, vector<int> &weights, int &objectives,
                     long long &lines, string &error) {
   string text;
   if (!readWholeFile(path, text)) {
-    error = "Could not read CSR values file.";
+    error = "Could not read CSR values file " + path + ".";
     return false;
   }
   TextScanner scanner(text);
@@ -211,7 +240,12 @@ bool readValuesFile(const string &path, vector<int> &weights, int &objectives,
     long long value = 0;
     while (!scanner.atEnd() && !scanner.atNewline()) {
       if (!scanner.readInt(value)) {
-        error = "Invalid token in CSR values file.";
+        error = "Invalid token in CSR values file at " +
+                where(path, scanner) + ".";
+        return false;
+      }
+      if (!validWeight(value)) {
+        error = "CSR " + weightError(value, where(path, scanner)) + ".";
         return false;
       }
       weights.push_back(static_cast<int>(value));
@@ -222,7 +256,8 @@ bool readValuesFile(const string &path, vector<int> &weights, int &objectives,
       if (objectives == 0) {
         objectives = onLine;
       } else if (onLine != objectives) {
-        error = "Inconsistent number of objectives.";
+        error = "Inconsistent number of objectives at " +
+                where(path, scanner) + ".";
         return false;
       }
       ++lines;
@@ -267,17 +302,27 @@ bool readCsrGraph(const string &prefix, CsrGraph &graph) {
   bool rowsOk = false, colsOk = false, valuesOk = false;
   int objectives = 0;
   long long lines = 0;
-  string valuesError;
+  string rowsError, colsError, valuesError;
   runConcurrently({
-      [&] { return rowsOk = readIntFile(prefix + "RowPtr.txt", graph.rowPtr); },
-      [&] { return colsOk = readIntFile(prefix + "ColInd.txt", graph.colInd); },
+      [&] {
+        return rowsOk = readIntFile(prefix + "RowPtr.txt", graph.rowPtr,
+                                    rowsError);
+      },
+      [&] {
+        return colsOk = readIntFile(prefix + "ColInd.txt", graph.colInd,
+                                    colsError);
+      },
       [&] {
         return valuesOk = readValuesFile(prefix + "Values.txt", graph.weights,
                                          objectives, lines, valuesError);
       },
   });
 
-  if (!rowsOk || graph.rowPtr.size() < 2) {
+  if (!rowsOk) {
+    cout << "Error: CSR row pointers: " << rowsError << "\n";
+    return false;
+  }
+  if (graph.rowPtr.size() < 2) {
     cout << "Error: Could not read CSR row pointers: " << prefix
          << "RowPtr.txt\n";
     return false;
@@ -294,7 +339,11 @@ bool readCsrGraph(const string &prefix, CsrGraph &graph) {
       return false;
     }
   }
-  if (!colsOk || static_cast<int>(graph.colInd.size()) != numberOfEdges) {
+  if (!colsOk) {
+    cout << "Error: CSR column indices: " << colsError << "\n";
+    return false;
+  }
+  if (static_cast<int>(graph.colInd.size()) != numberOfEdges) {
     cout << "Error: CSR column index file missing or size mismatch.\n";
     return false;
   }
@@ -444,7 +493,8 @@ bool readChangeBatch(const string &insertPath, const string &deletePath,
       long long value = 0;
       while (!scanner.atEnd() && !scanner.atNewline()) {
         if (!scanner.readInt(value)) {
-          cout << "Error: Invalid insert line.\n";
+          cout << "Error: Invalid insert line at "
+               << where(insertPath, scanner) << ".\n";
           return false;
         }
         tokens.push_back(value);
@@ -452,12 +502,22 @@ bool readChangeBatch(const string &insertPath, const string &deletePath,
       }
       if (!tokens.empty()) {
         if (static_cast<int>(tokens.size()) < 2 + numberOfObjectives) {
-          cout << "Error: Invalid insert line.\n";
+          cout << "Error: Invalid insert line at "
+               << where(insertPath, scanner) << ".\n";
           return false;
         }
         if (!inRange(tokens[0]) || !inRange(tokens[1])) {
-          cout << "Error: Inserted edge endpoint out of range.\n";
+          cout << "Error: Inserted edge endpoint out of range at "
+               << where(insertPath, scanner) << ".\n";
           return false;
+        }
+        for (int k = 0; k < numberOfObjectives; ++k) {
+          if (!validWeight(tokens[2 + k])) {
+            cout << "Error: Inserted edge "
+                 << weightError(tokens[2 + k], where(insertPath, scanner))
+                 << ".\n";
+            return false;
+          }
         }
         batch.insertFrom.push_back(static_cast<int>(tokens[0]));
         batch.insertTo.push_back(static_cast<int>(tokens[1]));
@@ -485,7 +545,8 @@ bool readChangeBatch(const string &insertPath, const string &deletePath,
       long long value = 0;
       while (!scanner.atEnd() && !scanner.atNewline()) {
         if (!scanner.readInt(value)) {
-          cout << "Error: Invalid delete line.\n";
+          cout << "Error: Invalid delete line at "
+               << where(deletePath, scanner) << ".\n";
           return false;
         }
         if (count < 2) {
@@ -496,7 +557,8 @@ bool readChangeBatch(const string &insertPath, const string &deletePath,
       }
       if (count >= 2) { // shorter lines are ignored, as before
         if (!inRange(pair[0]) || !inRange(pair[1])) {
-          cout << "Error: Deleted edge endpoint out of range.\n";
+          cout << "Error: Deleted edge endpoint out of range at "
+               << where(deletePath, scanner) << ".\n";
           return false;
         }
         batch.deleteFrom.push_back(static_cast<int>(pair[0]));
@@ -708,6 +770,14 @@ void transposeCsrGraph(const CsrGraph &graph, CsrGraph &reverse) {
   }
 }
 
+bool parseInteger(const string &text, long long minimum, long long maximum,
+                  long long &value) {
+  const char *begin = text.data(), *end = text.data() + text.size();
+  auto result = from_chars(begin, end, value);
+  return !text.empty() && result.ec == errc() && result.ptr == end &&
+         value >= minimum && value <= maximum;
+}
+
 // ============================================================================
 // Distance / parent files
 // ============================================================================
@@ -720,6 +790,8 @@ bool readDistances(const string &path, int numberOfNodes,
     return false;
   }
   distances.assign(numberOfNodes, DISTANCE_INF);
+  vector<char> seen(numberOfNodes, 0);
+  int listed = 0;
   TextScanner scanner(text);
   while (true) {
     scanner.skipWhitespace();
@@ -740,10 +812,28 @@ bool readDistances(const string &path, int numberOfNodes,
       return false;
     }
     if (vertex < 0 || vertex >= numberOfNodes) {
-      cout << "Error: Vertex ID out of range in distances file.\n";
+      cout << "Error: Vertex ID out of range in distances file at "
+           << where(path, scanner) << ".\n";
       return false;
     }
+    if (value < 0) {
+      cout << "Error: Negative distance at " << where(path, scanner)
+           << ".\n";
+      return false;
+    }
+    if (seen[vertex]) {
+      cout << "Error: Vertex " << vertex << " listed twice at "
+           << where(path, scanner) << ".\n";
+      return false;
+    }
+    seen[vertex] = 1;
+    ++listed;
     distances[vertex] = value;
+  }
+  if (listed != numberOfNodes) {
+    cout << "Error: " << path << " lists " << listed << " of "
+         << numberOfNodes << " vertices.\n";
+    return false;
   }
   return true;
 }
@@ -755,6 +845,8 @@ bool readParents(const string &path, int numberOfNodes, vector<int> &parent) {
     return false;
   }
   parent.assign(numberOfNodes, -1);
+  vector<char> seen(numberOfNodes, 0);
+  int listed = 0;
   TextScanner scanner(text);
   while (true) {
     scanner.skipWhitespace();
@@ -773,10 +865,23 @@ bool readParents(const string &path, int numberOfNodes, vector<int> &parent) {
     }
     if (vertex < 0 || vertex >= numberOfNodes || value < -1 ||
         value >= numberOfNodes) {
-      cout << "Error: Vertex ID out of range in SSSP tree file.\n";
+      cout << "Error: Vertex ID out of range in SSSP tree file at "
+           << where(path, scanner) << ".\n";
       return false;
     }
+    if (seen[vertex]) {
+      cout << "Error: Vertex " << vertex << " listed twice at "
+           << where(path, scanner) << ".\n";
+      return false;
+    }
+    seen[vertex] = 1;
+    ++listed;
     parent[vertex] = static_cast<int>(value);
+  }
+  if (listed != numberOfNodes) {
+    cout << "Error: " << path << " lists " << listed << " of "
+         << numberOfNodes << " vertices.\n";
+    return false;
   }
   return true;
 }

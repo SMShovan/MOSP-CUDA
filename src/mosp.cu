@@ -11,7 +11,8 @@
  *   --init <dir>       initial SOSP trees: <dir>/obj<k>/distancesOriginal.txt
  *                      and <dir>/obj<k>/SSSPTreeOriginal.txt
  *   -k <K>             number of objectives to use (default: all in the graph)
- *   --source <s>       source vertex (default 0)
+ *   --source <s>       source vertex (default 0); the --init trees must be
+ *                      rooted at it (`mospPrep init --source s`)
  *   --pref p1,..,pK    preference vector of the combined graph (default 1s;
  *                      lower value = higher priority, thesis Ch. 4 Step 2)
  *   --delta <D>        near-far bucket width (default: 32 * average weight /
@@ -54,6 +55,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -99,6 +101,18 @@ bool parseOptions(int argc, char **argv, Options &opt) {
       return true;
     };
     string value;
+    long long x = 0;
+    auto integer = [&](long long lo, long long hi) {
+      if (!next(value)) {
+        return false;
+      }
+      if (parseInteger(value, lo, hi, x)) {
+        return true;
+      }
+      cerr << a << " needs an integer in [" << lo << ", " << hi
+           << "], got '" << value << "'\n";
+      return false;
+    };
     if (a == "--graph") {
       if (!next(opt.graph)) return false;
     } else if (a == "--changes") {
@@ -112,20 +126,24 @@ bool parseOptions(int argc, char **argv, Options &opt) {
     } else if (a == "--cache") {
       if (!next(opt.cache)) return false;
     } else if (a == "-k") {
-      if (!next(value)) return false;
-      opt.K = atoi(value.c_str());
+      if (!integer(0, INT_MAX)) return false;
+      opt.K = static_cast<int>(x);
     } else if (a == "--source") {
-      if (!next(value)) return false;
-      opt.source = atoi(value.c_str());
+      if (!integer(0, INT_MAX)) return false;
+      opt.source = static_cast<int>(x);
     } else if (a == "--delta") {
-      if (!next(value)) return false;
-      opt.delta = atoll(value.c_str());
+      if (!integer(1, LLONG_MAX)) return false;
+      opt.delta = x;
     } else if (a == "--pref") {
       if (!next(value)) return false;
       istringstream list(value);
       string item;
       while (getline(list, item, ',')) {
-        opt.pref.push_back(atoi(item.c_str()));
+        if (!parseInteger(item, 1, INT_MAX, x)) {
+          cerr << "--pref needs integers >= 1, got '" << value << "'\n";
+          return false;
+        }
+        opt.pref.push_back(static_cast<int>(x));
       }
     } else if (a == "--canonicalize") {
       opt.canonicalize = true;

@@ -7,7 +7,8 @@
  *   mtx2csr <in.mtx> <outPrefix> <K> <wmin> <wmax> <seed>
  *       SuiteSparse Matrix Market file -> CSR text. Symmetric matrices get
  *       both edge directions; self-loops and duplicate edges are dropped;
- *       every edge gets K uniform random weights in [wmin, wmax].
+ *       every edge gets K uniform random weights in [wmin, wmax]
+ *       (1 <= K <= 32, 1 <= wmin <= wmax <= 2^31 - 1).
  *
  *   widen <inPrefix> <outPrefix> <K> <wmin> <wmax> <seed>
  *       Copy a graph and append random objectives until it has K (the
@@ -38,6 +39,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -75,6 +77,30 @@ int usage() {
   return 2;
 }
 
+/// Parse "<K> <wmin> <wmax> <seed>" (mtx2csr, widen).
+bool parseWeightArguments(char **argv, int &K, int &wmin, int &wmax,
+                          unsigned int &seed) {
+  long long k = 0, lo = 0, hi = 0, s = 0;
+  if (!parseInteger(argv[0], 1, 32, k)) {
+    cerr << "K must be an integer in [1, 32]\n";
+    return false;
+  }
+  if (!parseInteger(argv[1], 1, INT_MAX, lo) ||
+      !parseInteger(argv[2], lo, INT_MAX, hi)) {
+    cerr << "weights need 1 <= wmin <= wmax <= " << INT_MAX << "\n";
+    return false;
+  }
+  if (!parseInteger(argv[3], 0, UINT_MAX, s)) {
+    cerr << "seed must be an integer in [0, " << UINT_MAX << "]\n";
+    return false;
+  }
+  K = static_cast<int>(k);
+  wmin = static_cast<int>(lo);
+  wmax = static_cast<int>(hi);
+  seed = static_cast<unsigned int>(s);
+  return true;
+}
+
 int mtxToCsr(const string &in, const string &prefix, int K, int wmin,
              int wmax, unsigned int seed) {
   FILE *file = fopen(in.c_str(), "r");
@@ -101,7 +127,10 @@ int mtxToCsr(const string &in, const string &prefix, int K, int wmin,
   keys.reserve(symmetric ? 2 * entries : entries);
   for (long long i = 0; i < entries; ++i) {
     if (fgets(line, sizeof(line), file) == nullptr) {
-      break;
+      cerr << "Matrix Market file ends after " << i << " of " << entries
+           << " entries\n";
+      fclose(file);
+      return 1;
     }
     char *p = line;
     long long a = strtoll(p, &p, 10) - 1, b = strtoll(p, &p, 10) - 1;
@@ -180,41 +209,81 @@ bool parseChangeOptions(int argc, char **argv, int first,
       continue;
     }
     if (i + 1 >= argc) {
+      cerr << "missing value for " << a << "\n";
       return false;
     }
     string v = argv[++i];
+    long long x = 0;
+    auto integer = [&](long long lo, long long hi) {
+      if (parseInteger(v, lo, hi, x)) {
+        return true;
+      }
+      cerr << a << " needs an integer in [" << lo << ", " << hi
+           << "], got '" << v << "'\n";
+      return false;
+    };
     if (a == "--changes") {
-      opt.numberOfChanges = atoi(v.c_str());
+      if (!integer(0, INT_MAX)) return false;
+      opt.numberOfChanges = static_cast<int>(x);
     } else if (a == "--ins") {
-      opt.insertionPercentage = atof(v.c_str());
+      char *end = nullptr;
+      opt.insertionPercentage = strtod(v.c_str(), &end);
+      if (v.empty() || *end != '\0' || !(opt.insertionPercentage >= 0) ||
+          opt.insertionPercentage > 100) {
+        cerr << "--ins needs a percentage in [0, 100], got '" << v << "'\n";
+        return false;
+      }
     } else if (a == "--mode") {
       if (!parseChangeMode(v, opt.mode)) {
+        cerr << "unknown mode '" << v << "'\n";
         return false;
       }
     } else if (a == "--local") {
-      opt.localHops = atoi(v.c_str());
+      if (!integer(0, INT_MAX)) return false;
+      opt.localHops = static_cast<int>(x);
     } else if (a == "--seed") {
-      opt.seed = static_cast<unsigned int>(strtoul(v.c_str(), nullptr, 10));
+      if (!integer(0, UINT_MAX)) return false;
+      opt.seed = static_cast<unsigned int>(x);
     } else if (a == "--source") {
-      opt.source = atoi(v.c_str());
+      if (!integer(0, INT_MAX)) return false;
+      opt.source = static_cast<int>(x);
     } else if (a == "--wmin") {
-      opt.weightMin = atoi(v.c_str());
+      if (!integer(1, INT_MAX)) return false;
+      opt.weightMin = static_cast<int>(x);
     } else if (a == "--wmax") {
-      opt.weightMax = atoi(v.c_str());
+      if (!integer(1, INT_MAX)) return false;
+      opt.weightMax = static_cast<int>(x);
     } else {
+      cerr << "unknown option " << a << "\n";
       return false;
     }
+  }
+  if (opt.weightMin > opt.weightMax) {
+    cerr << "--wmin must not exceed --wmax\n";
+    return false;
   }
   return true;
 }
 
-int sourceOption(int argc, char **argv, int first) {
-  for (int i = first; i + 1 < argc; ++i) {
-    if (strcmp(argv[i], "--source") == 0) {
-      return atoi(argv[i + 1]);
+/// Optional "--source s" after the positional arguments (default 0);
+/// false on anything else or a source outside [0, n).
+bool sourceOption(int argc, char **argv, int first, int n, int &source) {
+  source = 0;
+  for (int i = first; i < argc; ++i) {
+    long long value = 0;
+    if (strcmp(argv[i], "--source") != 0 || i + 1 >= argc ||
+        !parseInteger(argv[i + 1], 0, INT_MAX, value)) {
+      cerr << "expected --source <vertex>\n";
+      return false;
     }
+    source = static_cast<int>(value);
+    ++i;
   }
-  return 0;
+  if (source >= n) {
+    cerr << "source " << source << " out of range [0, " << n << ")\n";
+    return false;
+  }
+  return true;
 }
 
 int dijkstraAll(const CsrGraph &graph, int source, const string &outDir,
@@ -244,12 +313,18 @@ int main(int argc, char **argv) {
   auto start = chrono::steady_clock::now();
   int rc = 0;
 
+  int K = 0, wmin = 0, wmax = 0, source = 0;
+  unsigned int seed = 0;
   if (command == "mtx2csr" && argc == 8) {
-    rc = mtxToCsr(argv[2], argv[3], atoi(argv[4]), atoi(argv[5]),
-                  atoi(argv[6]), static_cast<unsigned>(atoll(argv[7])));
+    if (!parseWeightArguments(argv + 4, K, wmin, wmax, seed)) {
+      return usage();
+    }
+    rc = mtxToCsr(argv[2], argv[3], K, wmin, wmax, seed);
   } else if (command == "widen" && argc == 8) {
-    rc = widen(argv[2], argv[3], atoi(argv[4]), atoi(argv[5]), atoi(argv[6]),
-               static_cast<unsigned>(atoll(argv[7])));
+    if (!parseWeightArguments(argv + 4, K, wmin, wmax, seed)) {
+      return usage();
+    }
+    rc = widen(argv[2], argv[3], K, wmin, wmax, seed);
   } else if (command == "cache" && argc == 4) {
     CsrGraph graph;
     rc = readCsrGraph(argv[2], graph) && saveCsrGraphBinary(argv[3], graph)
@@ -273,23 +348,30 @@ int main(int argc, char **argv) {
     cout << "changes: " << report << "\n";
   } else if (command == "init" && argc >= 4) {
     CsrGraph graph;
-    rc = readCsrGraph(argv[2], graph)
-             ? dijkstraAll(graph, sourceOption(argc, argv, 4), argv[3],
-                           "distancesOriginal.txt", "SSSPTreeOriginal.txt")
-             : 1;
+    if (!readCsrGraph(argv[2], graph)) {
+      rc = 1;
+    } else if (!sourceOption(argc, argv, 4, graph.numberOfNodes, source)) {
+      return usage();
+    } else {
+      rc = dijkstraAll(graph, source, argv[3], "distancesOriginal.txt",
+                       "SSSPTreeOriginal.txt");
+    }
   } else if (command == "expected" && argc >= 5) {
     CsrGraph original, updated;
     ChangeBatch batch;
     const string changes = argv[3];
-    rc = readCsrGraph(argv[2], original) &&
-                 readChangeBatch(changes + "/insert.txt",
-                                 changes + "/delete.txt",
-                                 original.numberOfObjectives,
-                                 original.numberOfNodes, batch) &&
-                 applyChangeBatch(original, batch, updated)
-             ? dijkstraAll(updated, sourceOption(argc, argv, 5), argv[4],
-                           "distancesUpdated.txt", "SSSPTreeUpdated.txt")
-             : 1;
+    if (!readCsrGraph(argv[2], original) ||
+        !readChangeBatch(changes + "/insert.txt", changes + "/delete.txt",
+                         original.numberOfObjectives, original.numberOfNodes,
+                         batch) ||
+        !applyChangeBatch(original, batch, updated)) {
+      rc = 1;
+    } else if (!sourceOption(argc, argv, 5, original.numberOfNodes, source)) {
+      return usage();
+    } else {
+      rc = dijkstraAll(updated, source, argv[4], "distancesUpdated.txt",
+                       "SSSPTreeUpdated.txt");
+    }
   } else {
     return usage();
   }

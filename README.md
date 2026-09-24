@@ -77,7 +77,8 @@ bin/mosp --graph g/csr/graphCsr --changes g/changes --init g/init --out out --va
 ```
 mosp --graph <csrPrefix> --changes <dir> --init <dir> [options]
   -k K               use the first K objectives (default: all)
-  --source s         source vertex (default 0)
+  --source s         source vertex (default 0); must be the source of the
+                     --init trees (mospPrep init --source s)
   --pref p1,..,pK    preference vector (default all 1s; lower = higher priority)
   --delta D          near-far bucket width (default 32 * avg weight / avg degree)
   --cache file       binary cache of the graph (written if missing or stale)
@@ -126,7 +127,11 @@ would disconnect a vertex from the source.
 - **Disconnection:** vertices that the batch cuts off from the source get
   distance INF and parent -1 (the update invalidates the subtrees of
   deleted or weight-increased tree edges instead of counting to infinity).
-- **Weights** must be positive integers; distances are 64-bit.
+- **Inputs are checked:** weights must be integers in [1, 2^31 - 1]
+  (graph and inserted edges), vertex ids and offsets must be in range,
+  every distance and tree file must list every vertex exactly once, and
+  the initial trees must be rooted at `--source`; violations stop the run
+  with an error naming the file and line. Distances are 64-bit.
 - **Scale:** the search packs (distance, parent) into 64 bits when
   (n - 1) * maxWeight fits next to the parent ids and otherwise falls back
   to 64-bit distances with a parent-recovery pass.

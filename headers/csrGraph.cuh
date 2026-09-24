@@ -50,7 +50,14 @@ struct ChangeBatch {
   int numberOfDeletes() const { return static_cast<int>(deleteFrom.size()); }
 };
 
-/** @brief Read <prefix>RowPtr.txt, <prefix>ColInd.txt and <prefix>Values.txt. */
+/**
+ * @brief Read <prefix>RowPtr.txt, <prefix>ColInd.txt and <prefix>Values.txt.
+ *
+ * @details
+ * Rejects (with a message naming the file and line) row pointers that do
+ * not start at 0 or decrease, column indices outside [0, n), ids or offsets
+ * above INT_MAX, and weights outside [1, INT_MAX].
+ */
 bool readCsrGraph(const std::string &prefix, CsrGraph &graph);
 
 /** @brief Write a graph in the same three-file text format. */
@@ -76,6 +83,10 @@ bool loadCsrGraph(const std::string &prefix, CsrGraph &graph,
 /**
  * @brief Read insert.txt ("u v w1 .. wK") and delete.txt ("u v").
  *
+ * @details
+ * Endpoints must be in [0, numberOfNodes) and inserted weights in
+ * [1, INT_MAX]; errors name the file and line.
+ *
  * @param numberOfObjectives Weights expected per insertion.
  * @param numberOfNodes      Vertex count used to validate endpoints.
  */
@@ -100,11 +111,22 @@ bool applyChangeBatch(const CsrGraph &original, ChangeBatch &batch,
 /** @brief Build the reverse graph: row v lists u for every edge u -> v. */
 void transposeCsrGraph(const CsrGraph &graph, CsrGraph &reverse);
 
-/** @brief Read a distance file ("v d" or "v INF" per line). */
+/**
+ * @brief Read a distance file ("v d" or "v INF" per line).
+ *
+ * @details
+ * Every vertex must be listed exactly once and distances must not be
+ * negative (an incomplete file would silently leave vertices at INF).
+ */
 bool readDistances(const std::string &path, int numberOfNodes,
                    std::vector<long long> &distances);
 
-/** @brief Read a parent file ("v p" per line, p = -1 for none). */
+/**
+ * @brief Read a parent file ("v p" per line, p = -1 for none).
+ *
+ * @details
+ * Every vertex must be listed exactly once, with p in [-1, numberOfNodes).
+ */
 bool readParents(const std::string &path, int numberOfNodes,
                  std::vector<int> &parent);
 
@@ -127,6 +149,15 @@ bool writeParents(const std::string &path, const std::vector<int> &parent);
  * @return true if every job returned true.
  */
 bool runConcurrently(const std::vector<std::function<bool()>> &jobs);
+
+/**
+ * @brief Parse a whole decimal integer (command-line values).
+ *
+ * @return false if @p text is empty, has trailing characters, or the value
+ *         is outside [@p minimum, @p maximum].
+ */
+bool parseInteger(const std::string &text, long long minimum,
+                  long long maximum, long long &value);
 
 /** @brief Distance sentinel used throughout (as in the original code). */
 constexpr long long DISTANCE_INF = 0x7fffffffffffffffLL / 4;
