@@ -103,18 +103,24 @@ int main() {
     return 1;
   }
 
-  // 6. Parallel SOSP Update (CUDA) — one per objective
+  // 6a. Initial SOSP trees of every objective (Dijkstra on the original
+  //     graph). They are inputs of the update, so they are computed before
+  //     the update loop instead of inside it.
+  for (int obj = 0; obj < numberOfObjectives; ++obj) {
+    string objDir = "output/parallelSospObj" + to_string(obj);
+    if (!runDijkstraCSR("data/originalGraph/graphCsr", obj, source,
+                        objDir + "/distancesOriginal.txt",
+                        objDir + "/SSSPTreeOriginal.txt")) {
+      return 1;
+    }
+  }
+
+  // 6b. Parallel SOSP Update (CUDA) — one per objective
   vector<string> treeOutputPaths;
   for (int obj = 0; obj < numberOfObjectives; ++obj) {
     string objDir = "output/parallelSospObj" + to_string(obj);
-
-    // Run Dijkstra for this objective on the original graph
     string dijkstraDistPath = objDir + "/distancesOriginal.txt";
     string dijkstraTreePath = objDir + "/SSSPTreeOriginal.txt";
-    if (!runDijkstraCSR("data/originalGraph/graphCsr", obj, source, dijkstraDistPath,
-                        dijkstraTreePath)) {
-      return 1;
-    }
 
     // Run CUDA parallel SOSP Update for this objective
     string parallelDistPath = objDir + "/distancesParallelUpdate.txt";
