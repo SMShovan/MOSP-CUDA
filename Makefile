@@ -18,7 +18,8 @@ APP      := $(BINDIR)/main
 
 # Base sources (shared by all targets)
 BASE_SRCS := $(SRCDIR)/generateGraph.cu $(SRCDIR)/generateGraphCSR.cu $(SRCDIR)/generateChangedEdges.cu $(SRCDIR)/updateGraphCSR.cu $(SRCDIR)/generateTestCases.cu $(SRCDIR)/Dijkstra.cu $(SRCDIR)/read.cu \
-             $(SRCDIR)/csrGraph.cu $(SRCDIR)/stageTimer.cu $(SRCDIR)/validation.cu
+             $(SRCDIR)/csrGraph.cu $(SRCDIR)/stageTimer.cu $(SRCDIR)/validation.cu \
+             $(SRCDIR)/changeGenerator.cu
 
 # Main application (includes sequential SOSP update)
 MAIN_SRCS := $(SRCDIR)/main.cu $(BASE_SRCS) $(SRCDIR)/sequentialSOSPUpdate.cu $(SRCDIR)/parallelSOSPUpdate.cu $(SRCDIR)/parallelCombinedGraph.cu
@@ -33,7 +34,7 @@ PARALLEL_STRESS_SRCS := $(SRCDIR)/parallelStressTest.cu $(BASE_SRCS) $(SRCDIR)/p
 PARALLEL_STRESS_OBJS := $(PARALLEL_STRESS_SRCS:$(SRCDIR)/%.cu=$(BUILDDIR)/%.o)
 
 # Input preparation tool
-PREP_SRCS := $(SRCDIR)/mospPrep.cu $(SRCDIR)/csrGraph.cu $(SRCDIR)/Dijkstra.cu $(SRCDIR)/read.cu
+PREP_SRCS := $(SRCDIR)/mospPrep.cu $(SRCDIR)/changeGenerator.cu $(SRCDIR)/csrGraph.cu $(SRCDIR)/Dijkstra.cu $(SRCDIR)/read.cu
 PREP_OBJS := $(PREP_SRCS:$(SRCDIR)/%.cu=$(BUILDDIR)/%.o)
 
 # Driver for prepared inputs (benchmarks, validation)
