@@ -17,3 +17,4 @@
 *.nsys-rep
 *.ncu-rep
 *.sqlite
+/bench-output/

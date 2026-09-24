@@ -41,6 +41,7 @@
 #include "parallelSOSPUpdate.cuh"
 
 #include "read.cuh"
+#include "stageTimer.cuh"
 
 #include <cuda_runtime.h>
 
@@ -463,6 +464,7 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
   // ========================================================================
 
   // --- 0a. Read original graph from CSR and determine dimensions ---
+  ScopedStage readStage("sosp/0a_read_csr_text");
   Graph originalGraph;
   int numberOfObjectives = 0;
   if (!readCSR(originalCsrPrefix, originalGraph, numberOfObjectives)) {
@@ -486,14 +488,19 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
     return false;
   }
 
+  readStage.stop();
+
   // --- 0b. Build forward and reverse adjacency lists ---
+  ScopedStage adjacencyStage("sosp/0b_build_adjacency_host");
   vector<vector<WeightedNeighbor>> outAdjacency;
   vector<vector<WeightedNeighbor>> inAdjacency;
   buildAdjacencyLists(originalGraph, objectiveIndex, outAdjacency, inAdjacency);
 
   originalGraph.clear();
+  adjacencyStage.stop();
 
   // --- 0c. Read original distances and parent arrays ---
+  ScopedStage treeStage("sosp/0c_read_tree_text");
   vector<long long> distances;
   if (!readDistancesFromFile(distancesInputPath, distances, numberOfNodes,
                              INF_VALUE)) {
@@ -505,7 +512,10 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
     return false;
   }
 
+  treeStage.stop();
+
   // --- 0d. Read inserted and deleted edges ---
+  ScopedStage changesStage("sosp/0d_read_changes_text");
   struct InsertedEdge {
     int from;
     int to;
@@ -560,7 +570,10 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
     }
   }
 
+  changesStage.stop();
+
   // --- 0e. Apply topological changes to adjacency lists (Host) ---
+  ScopedStage applyStage("sosp/0e_apply_changes_host");
   struct WeightIncrease {
     int from;
     int to;
@@ -603,9 +616,12 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
     }
   }
 
+  applyStage.stop();
+
   // ========================================================================
   // PHASE 1: PROCESS CHANGED EDGES (Host — tiny batch, order-dependent)
   // ========================================================================
+  ScopedStage step1Stage("sosp/1_process_changes_host");
 
   vector<int> isAffected(numberOfNodes, 0);
   vector<int> affectedVertices;
@@ -691,7 +707,11 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
   // PHASE 2: PROPAGATE THE UPDATE (CUDA Kernels)
   // ========================================================================
 
+  step1Stage.stop();
+  recordCounter("sosp/initial_affected", affectedVertices.size());
+
   // --- Flatten adjacency lists to CSR for device transfer ---
+  ScopedStage flattenStage("sosp/2a_flatten_csr_host");
   vector<int> h_outRowPtr, h_outColInd;
   vector<long long> h_outWeights;
   flattenToCSR(outAdjacency, h_outRowPtr, h_outColInd, h_outWeights);
@@ -707,7 +727,10 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
   int outNnz = static_cast<int>(h_outColInd.size());
   int inNnz = static_cast<int>(h_inColInd.size());
 
+  flattenStage.stop();
+
   // --- Allocate device memory ---
+  ScopedStage uploadStage("sosp/2b_alloc_h2d", true);
   int *d_outRowPtr = nullptr, *d_outColInd = nullptr;
   int *d_inRowPtr = nullptr, *d_inColInd = nullptr;
   long long *d_inWeights = nullptr;
@@ -765,7 +788,11 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
                           cudaMemcpyHostToDevice));
   }
 
+  uploadStage.stop();
+
   // --- Iterative propagation loop ---
+  ScopedStage propagateStage("sosp/2c_propagate_gpu", true);
+  long long totalCandidates = 0;
   const int BLOCK_SIZE = 256;
   int iterationCount = 0;
   const int maxIterations = numberOfNodes;
@@ -791,6 +818,7 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
     CUDA_CHECK(cudaMemcpy(&h_candidateCount, d_candidateCount, sizeof(int),
                           cudaMemcpyDeviceToHost));
 
+    totalCandidates += h_candidateCount;
     if (h_candidateCount == 0)
       break;
 
@@ -810,6 +838,10 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
                           cudaMemcpyDeviceToHost));
   }
 
+  propagateStage.stop();
+  recordCounter("sosp/iterations", iterationCount);
+  recordCounter("sosp/candidates", totalCandidates);
+
   if (iterationCount >= maxIterations && h_affectedCount > 0) {
     cout << "Warning: SOSP update reached maximum iteration limit ("
          << maxIterations << "). Running reachability check.\n";
@@ -819,6 +851,7 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
   // POST-PROCESSING: REACHABILITY CHECK (CUDA BFS)
   // ========================================================================
 
+  ScopedStage bfsStage("sosp/3_bfs_reachability_gpu", true);
   {
     int *d_reachable = nullptr;
     int *d_frontier = nullptr, *d_nextFrontier = nullptr;
@@ -871,9 +904,12 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
     CUDA_CHECK(cudaFree(d_nextFrontierCount));
   }
 
+  bfsStage.stop();
+
   // ========================================================================
   // COPY RESULTS BACK TO HOST
   // ========================================================================
+  ScopedStage downloadStage("sosp/4_d2h_free", true);
 
   CUDA_CHECK(cudaMemcpy(distances.data(), d_distances,
                         numberOfNodes * sizeof(long long),
@@ -896,9 +932,12 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
   CUDA_CHECK(cudaFree(d_affectedCount));
   CUDA_CHECK(cudaFree(d_candidateCount));
 
+  downloadStage.stop();
+
   // ========================================================================
   // WRITE OUTPUT (Host — I/O)
   // ========================================================================
+  ScopedStage writeStage("sosp/5_write_text");
 
   filesystem::path distOutPath(distancesOutputPath);
   if (!distOutPath.parent_path().empty()) {
