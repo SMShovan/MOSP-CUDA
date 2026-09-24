@@ -6,6 +6,7 @@
 #include "generateGraph.cuh"
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -125,6 +126,10 @@ bool generateGraph(
         addEdgeIfNew(u, v, directed, edgeSet, edges);
     }
 
+    filesystem::path outputPath(outputFile);
+    if (!outputPath.parent_path().empty()) {
+        filesystem::create_directories(outputPath.parent_path());
+    }
     ofstream out(outputFile);
     if (!out.is_open()) {
         cout << "Error: Could not open output file.\n";
