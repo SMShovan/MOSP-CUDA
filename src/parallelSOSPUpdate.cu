@@ -169,7 +169,9 @@ __global__ void updateDistancesKernel(
       continue;
 
     long long candidateDistance = parentDist + candidateWeight;
-    if (candidateDistance < bestDistance) {
+    // Ties go to the lowest parent id (canonical SOSP tree).
+    if (candidateDistance < bestDistance ||
+        (candidateDistance == bestDistance && candidateParent < bestParent)) {
       bestDistance = candidateDistance;
       bestParent = candidateParent;
     }
@@ -402,7 +404,9 @@ void findBestParent(int vertex,
     }
 
     long long candidateDistance = distances[candidateParent] + candidateWeight;
-    if (candidateDistance < bestDistance) {
+    // Ties go to the lowest parent id (canonical SOSP tree).
+    if (candidateDistance < bestDistance ||
+        (candidateDistance == bestDistance && candidateParent < bestParent)) {
       bestDistance = candidateDistance;
       bestParent = candidateParent;
     }
@@ -654,6 +658,8 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
         isAffected[v] = 1;
         affectedVertices.push_back(v);
       }
+    } else if (newDistance == distances[v] && v != source && u < parent[v]) {
+      parent[v] = u; // equal distance: the lowest parent id wins
     }
   }
 
