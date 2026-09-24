@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
     cout.setf(ios::unitbuf);
   }
   // Stage timers are always on in this driver: the GPU-compute scope is
-  // the sum of the GPU update stages (Steps 1 and 2) of every call.
+  // the sum of the GPU stages of every call.
   setInstrumentation(true);
   const string csv =
       opt.timingCsv.empty() ? opt.out + "/stages.csv" : opt.timingCsv;
@@ -196,7 +196,9 @@ int main(int argc, char **argv) {
   if (!opt.quiet) {
     printInstrumentation(cout);
   }
-  const double gpuCompute = totalStageTime("sosp/update_gpu");
+  // Every GPU-compute stage name ends in "_gpu": the K SOSP updates
+  // (Steps 1-2) and the combined graph + its SOSP (Steps 2-3 of MOSP).
+  const double gpuCompute = totalStageTime("_gpu");
   cout << "RESULT gpu_compute_ms=" << gpuCompute
        << " end_to_end_ms=" << endToEnd << "\n";
 
