@@ -17,12 +17,14 @@
  * directed graphs (the repository's generator) and road-like grids.
  *
  * Usage: mospTest [--seed S] [--work DIR] [--only GROUP]
- *   GROUP: thesis-example, regressions, large-weights, generator, apply,
- *          sosp (default: all). Exit code 0 = all checks passed.
+ *   GROUP: thesis-example, regressions, large-weights, packing-boundary,
+ *          generator, apply, sosp (default: all). Exit code 0 = all checks
+ *          passed.
  */
 
 #include "changeGenerator.cuh"
 #include "csrGraph.cuh"
+#include "deviceGraph.cuh"
 #include "dijkstra.cuh"
 #include "generateChangedEdges.cuh"
 #include "generateGraphCSR.cuh"
@@ -30,6 +32,7 @@
 #include "parallelCombinedGraph.cuh"
 #include "parallelSOSPUpdate.cuh"
 #include "sequentialSOSPUpdate.cuh"
+#include "sospUpdateGpu.cuh"
 #include "updateGraphCSR.cuh"
 #include "validation.cuh"
 
@@ -651,6 +654,121 @@ void runLargeWeights(unsigned int seed) {
   cout << "large-weights: " << cases << " cases (distance-only fallback)\n";
 }
 
+/// false if following the parents from some vertex runs into a cycle (or
+/// out of the id range) instead of ending at a vertex without parent.
+bool parentsAcyclic(const vector<int> &parent) {
+  const int n = static_cast<int>(parent.size());
+  vector<char> state(n, 0); // 0: not seen, 1: on the current walk, 2: done
+  for (int start = 0; start < n; ++start) {
+    int v = start;
+    while (v >= 0 && v < n && state[v] == 0) {
+      state[v] = 1;
+      v = parent[v];
+    }
+    if (v >= n || (v >= 0 && state[v] == 1)) {
+      return false;
+    }
+    for (int u = start; u >= 0 && state[u] == 1; u = parent[u]) {
+      state[u] = 2;
+    }
+  }
+  return true;
+}
+
+/// Packed words at their limit: n = 2^17 - 1 vertices need b = 17 parent
+/// bits and leave 47 bits for distances. On the path 0 -> 1 -> ... -> n-1
+/// with every weight W = 2^30 + 2^14, (n - 1) * W = 2^47 - 2^15 still fits,
+/// so the packed format is used, but an edge n-1 -> 1 forms the candidate
+/// n * W > 2^47 - 1, which must not be packed (it would wrap around to a
+/// small word and win). Three entry points: the pull pass (the edge is
+/// inserted), the push loop (the edge exists and a cheaper last path edge
+/// makes n-1 push it) and the search from scratch (Step 3's engine). Each
+/// result must equal Dijkstra (distances and parents) and be acyclic.
+void runPackingBoundary(unsigned int) {
+  const int n = (1 << 17) - 1, source = 0;
+  const int W = (1 << 30) + (1 << 14);
+  auto path = [&](bool backEdge) {
+    CsrGraph graph;
+    graph.numberOfNodes = n;
+    graph.numberOfObjectives = 1;
+    graph.rowPtr.assign(n + 1, 0);
+    for (int u = 0; u < n; ++u) {
+      if (u + 1 < n) {
+        graph.colInd.push_back(u + 1);
+        graph.weights.push_back(W);
+      } else if (backEdge) {
+        graph.colInd.push_back(1);
+        graph.weights.push_back(W);
+      }
+      graph.rowPtr[u + 1] = static_cast<int>(graph.colInd.size());
+    }
+    return graph;
+  };
+  struct Case {
+    string name;
+    bool backEdge;
+    int from, to, weight; // the one inserted edge; from < 0: from scratch
+  };
+  const vector<Case> cases = {
+      {"pull", false, n - 1, 1, W},
+      {"push", true, n - 2, n - 1, W - 1},
+      {"from-scratch", true, -1, -1, 0},
+  };
+  int ran = 0;
+  for (const auto &c : cases) {
+    const string name = "packing-boundary/" + c.name;
+    CsrGraph original = path(c.backEdge), updated, reverse;
+    ChangeBatch batch;
+    batch.numberOfObjectives = 1;
+    if (c.from >= 0) {
+      batch.insertFrom = {c.from};
+      batch.insertTo = {c.to};
+      batch.insertWeights = {c.weight};
+    }
+    applyChangeBatch(original, batch, updated);
+    transposeCsrGraph(updated, reverse);
+    vector<long long> dist, refDist;
+    vector<int> parent, refParent;
+    dijkstraCsrGraph(original, 0, source, dist, parent);
+    dijkstraCsrGraph(updated, 0, source, refDist, refParent);
+
+    DeviceGraph graph;
+    DeviceArray<long long> d_dist;
+    DeviceArray<int> d_parent, d_heads, d_none;
+    SospWorkspace workspace;
+    SospStats stats;
+    bool ok = uploadDeviceGraph(updated, graph) && d_dist.upload(dist) &&
+              d_parent.upload(parent) && d_heads.upload(batch.insertTo) &&
+              d_none.upload({});
+    const long long delta = defaultDelta(updated.numberOfEdges(), n,
+                                         static_cast<long long>(W) * n);
+    if (ok && c.from >= 0) {
+      DeviceChanges changes;
+      changes.changedFrom = changes.changedTo = d_none.data();
+      changes.insertHeads = d_heads.data();
+      changes.numberOfInsertHeads = 1;
+      ok = sospUpdateGpu(graph.out(0), graph.in(0), changes, source, delta, W,
+                         workspace, d_dist.data(), d_parent.data(), &stats);
+    } else if (ok) {
+      ok = sospFromScratchGpu(graph.out(0), source, delta, W, workspace,
+                              d_dist.data(), d_parent.data(), &stats);
+    }
+    ok = ok && d_dist.download(dist) && d_parent.download(parent);
+    if (!ok) {
+      report(name, false, "GPU call failed");
+      continue;
+    }
+    report(name, stats.packedParents,
+           "expected the packed format (the case tests its limit)");
+    TreeCheck check =
+        checkSospTree(reverse, 0, source, dist, parent, refDist, &refParent);
+    report(name, check.ok(true), check.summary());
+    report(name, parentsAcyclic(parent), "the parent graph has a cycle");
+    ++ran;
+  }
+  cout << "packing-boundary: " << ran << " cases\n";
+}
+
 /// Uniform generator mode reproduces generateChangedEdges() exactly.
 void runGeneratorEquivalence(unsigned int seed) {
   int cases = 0;
@@ -758,6 +876,7 @@ int main(int argc, char **argv) {
       {"thesis-example", runThesisExample},
       {"regressions", runRegressions},
       {"large-weights", runLargeWeights},
+      {"packing-boundary", runPackingBoundary},
       {"generator", runGeneratorEquivalence},
       {"apply", runApplyEquivalence},
       {"sosp", runSosp},

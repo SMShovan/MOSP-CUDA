@@ -63,6 +63,12 @@
  * recovered after the search: one pass over the out-edges gives every
  * vertex the lowest id among its in-neighbours u with
  * d[u] + w(u,v) == d[v] (sm_86 has no 128-bit atomics for a wider word).
+ * The bound covers every stored distance, but a candidate (a stored
+ * distance plus one more edge) can exceed it by up to maxWeight: the pull
+ * pass and the push loop drop every candidate above the bound before
+ * packing it. No shortest path is longer than the bound, so the dropped
+ * candidates are never needed, and a candidate that did not fit would
+ * wrap around in the shifted word and win the atomicMin.
  * ============================================================================
  */
 
@@ -316,11 +322,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
       for (int e = p.in.rowPtr[v]; e < p.in.rowPtr[v + 1]; ++e) {
         int u = p.in.colInd[e];
         u64 word = load(&p.packed[u]);
-        if (word != PACKED_INF) {
-          best = min(best,
-                     packing.pack(packing.distance(word) +
-                                      static_cast<u64>(p.in.weights[e]),
-                                  u));
+        if (word == PACKED_INF) {
+          continue;
+        }
+        const u64 nd =
+            packing.distance(word) + static_cast<u64>(p.in.weights[e]);
+        if (nd <= p.maxDistance) { // larger: never shortest, may not fit
+          best = min(best, packing.pack(nd, u));
         }
       }
       if (best < current) {
@@ -394,6 +402,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
             continue;
           }
           u64 nd = du + static_cast<u64>(p.out.weights[e]);
+          if (nd > p.maxDistance) {
+            continue; // never shortest; would not fit the packed word
+          }
           u64 candidate = packing.pack(nd, u);
           if (candidate >= load(&p.packed[w])) {
             continue;
@@ -653,6 +664,8 @@ bool runPersistent(Params &params, SospWorkspace &ws, SospStats &stats) {
 
 /// Choose the packing for n vertices and the distance bound
 /// (n - 1) * maxWeight; fails only if distances could overflow 64 bits.
+/// The kernel drops candidates above the bound, so every packed distance
+/// stays within it.
 bool choosePacking(int n, long long maxWeight, Params &params) {
   const u64 weight = static_cast<u64>(max(maxWeight, 1LL));
   const u64 hops = static_cast<u64>(max(n - 1, 1));
