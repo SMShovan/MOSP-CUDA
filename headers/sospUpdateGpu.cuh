@@ -34,6 +34,7 @@ struct DeviceChanges {
 /// Counters reported by one update.
 struct SospStats {
   int invalidated = 0;  ///< vertices in invalidated subtrees
+  int jumpRounds = 0;   ///< pointer-jumping rounds until convergence
   int iterations = 0;   ///< near-far push iterations
   int epochs = 0;       ///< far-pile threshold increases
   long long pushes = 0; ///< vertex expansions
@@ -43,6 +44,7 @@ struct SospStats {
  * @brief Device scratch space for updates on graphs with up to
  *        capacity vertices; reserve once and reuse for every objective
  *        and for the combined graph (no allocation inside the updates).
+ *        reserve() also sizes the grid of the persistent kernel.
  */
 struct SospWorkspace {
   SospWorkspace() = default;
@@ -65,10 +67,10 @@ struct SospWorkspace {
   int *ancestor = nullptr;              ///< pointer-jumping ancestors
   int *listA = nullptr, *listB = nullptr, *farA = nullptr, *farB = nullptr;
   int *candidates = nullptr;
-  int *counters = nullptr;              ///< device counters
-  unsigned long long *minimum = nullptr;
-  int *hostCounters = nullptr;          ///< pinned mirror of the counters
-  unsigned long long *hostMinimum = nullptr;
+  int *frontier = nullptr;
+  void *control = nullptr;              ///< device control block
+  void *hostControl = nullptr;          ///< pinned copy of the control block
+  int gridBlocks = 0;                   ///< co-resident blocks (cooperative)
 };
 
 /**

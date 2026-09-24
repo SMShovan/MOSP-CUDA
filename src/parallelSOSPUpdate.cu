@@ -476,6 +476,7 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
     }
   }
   recordCounter("sosp/invalidated", stats.invalidated);
+  recordCounter("sosp/jump_rounds", stats.jumpRounds);
   recordCounter("sosp/iterations", stats.iterations);
   recordCounter("sosp/epochs", stats.epochs);
   recordCounter("sosp/pushes", stats.pushes);

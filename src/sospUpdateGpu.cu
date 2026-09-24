@@ -1,6 +1,7 @@
 /**
  * @file sospUpdateGpu.cu
- * @brief Work-efficient, disconnection-safe SOSP update on the GPU.
+ * @brief Work-efficient, disconnection-safe SOSP update on the GPU, run by
+ *        one persistent cooperative kernel (device-side control).
  *
  * ============================================================================
  * ALGORITHM
@@ -10,8 +11,9 @@
  *   - Roots: the head v of every deleted or weight-increased edge (u,v)
  *     with Parent[v] == u.
  *   - Subtree invalidation: pointer jumping over the parent array marks
- *     every descendant of a root (ceil(log2 n) rounds, no host sync). The
- *     marked vertices lose their distance (INF) and parent.
+ *     every descendant of a root. Rounds stop as soon as no vertex is still
+ *     jumping (at most ceil(log2 n) rounds). The marked vertices lose their
+ *     distance (INF) and parent.
  *   - Pull pass: every invalidated vertex and every head of an inserted
  *     edge takes the best (distance, parent id) pair over its in-neighbours
  *     (a destination-grouped Step 1: one thread per destination).
@@ -38,6 +40,15 @@
  *   - Work-efficient: only improved vertices are expanded (no candidate
  *     re-scan of all in-edges, no O(n) reset per iteration).
  *
+ * Control: everything above runs inside one cooperative kernel; the phases
+ * are separated by grid-wide barriers and the loop decisions are taken on
+ * the device, so an update costs one launch and one final copy of the
+ * statistics instead of several host round trips per iteration. Counters
+ * that are appended to in one phase and reset for a later one rotate over
+ * three slots, which lets every push iteration and every pointer-jumping
+ * round get by with a single grid barrier. Data written by other blocks is
+ * read with __ldcg (L2), since L1 is not coherent within a kernel.
+ *
  * Packing: b = number of bits needed for the vertex ids plus a "no parent"
  * value; the remaining 64 - b bits hold the distance, and the all-ones word
  * is INF. The distance bound (n - 1) * maxWeight must fit (checked).
@@ -47,8 +58,8 @@
 #include "sospUpdateGpu.cuh"
 
 #include "csrGraph.cuh"
-#include "stageTimer.cuh"
 
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -56,20 +67,13 @@
 #include <iostream>
 
 using namespace std;
+namespace cg = cooperative_groups;
 
 namespace {
 
 using u64 = unsigned long long;
 constexpr u64 PACKED_INF = ~0ULL;
 constexpr int BLOCK_SIZE = 256;
-
-// Device counter slots.
-constexpr int NEAR_A = 0;     // near-frontier output (even iterations)
-constexpr int FAR_COUNT = 1;  // far pile size
-constexpr int NEAR_B = 2;     // near-frontier output (odd iterations)
-constexpr int LIST_COUNT = 3; // candidate / frontier list size
-constexpr int OVERFLOW = 4;   // a distance does not fit the packing
-constexpr int NUM_COUNTERS = 8;
 
 #define GPU_CHECK(call)                                                        \
   do {                                                                         \
@@ -80,10 +84,6 @@ constexpr int NUM_COUNTERS = 8;
       return false;                                                            \
     }                                                                          \
   } while (0)
-
-int blocks(long long work) {
-  return static_cast<int>((max(work, 1LL) + BLOCK_SIZE - 1) / BLOCK_SIZE);
-}
 
 /// Packed (distance, parent) words.
 struct Packing {
@@ -111,254 +111,349 @@ Packing makePacking(int numberOfNodes) {
   return {bits, (1ULL << bits) - 1};
 }
 
+/// Device-side control block of one update (initialized before launch).
+struct Control {
+  int listCount;     ///< candidates (invalidated + insert heads)
+  int frontierCount; ///< vertices improved by the pull pass
+  int nearCount[3];  ///< near-frontier appends, rotating slots
+  int farCount;      ///< far pile size
+  int far2Count;     ///< re-split far pile size
+  int active[3];     ///< pointer jumping: a vertex still jumps
+  int overflow;      ///< an input distance does not fit the packing
+  int invalidated;
+  int rounds;
+  int iterations;
+  int epochs;
+  int generation;    ///< last stamp generation used
+  long long pushes;
+  u64 minimum;       ///< min-reduction slot (PACKED_INF when idle)
+};
+
+/// Parameters of the persistent kernel.
+struct Params {
+  DeviceCsr out, in;
+  DeviceChanges changes;
+  int source;
+  bool fromScratch;
+  Packing packing;
+  u64 maxDistance;
+  u64 delta;
+  int maxRounds;
+  int generation; ///< first stamp generation to use
+  long long *distances;
+  int *parent;
+  u64 *packed;
+  int *stamp, *inFar, *flag, *ancestor;
+  int *candidates, *frontier, *nearA, *nearB, *farA, *farB;
+  Control *control;
+};
+
+__device__ __forceinline__ int load(const int *p) { return __ldcg(p); }
+__device__ __forceinline__ u64 load(const u64 *p) { return __ldcg(p); }
+
 __device__ __forceinline__ bool claim(int *stamp, int v, int generation) {
   return atomicExch(&stamp[v], generation) != generation;
 }
 
-// ---------------------------------------------------------------------------
-// Step 1 kernels
-// ---------------------------------------------------------------------------
-
-__global__ void packKernel(int n, const long long *distances,
-                           const int *parent, u64 *packed, Packing packing,
-                           u64 maxDistance, int *counters) {
-  int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v >= n) {
-    return;
+/// Warp-wide minimum of per-thread values, folded into *target.
+__device__ void minimumInto(u64 value, u64 *target) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value = min(value, __shfl_down_sync(0xffffffffu, value, offset));
   }
-  long long d = distances[v];
-  if (d >= DISTANCE_INF / 2) {
-    packed[v] = PACKED_INF;
-    return;
-  }
-  if (d < 0 || static_cast<u64>(d) > maxDistance) {
-    counters[OVERFLOW] = 1;
-    packed[v] = PACKED_INF;
-    return;
-  }
-  packed[v] = packing.pack(static_cast<u64>(d), parent[v]);
-}
-
-__global__ void unpackKernel(int n, const u64 *packed, long long *distances,
-                             int *parent, Packing packing) {
-  int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v >= n) {
-    return;
-  }
-  u64 word = packed[v];
-  if (word == PACKED_INF) {
-    distances[v] = DISTANCE_INF;
-    parent[v] = -1;
-    return;
-  }
-  distances[v] = static_cast<long long>(packing.distance(word));
-  parent[v] = packing.parent(word);
-}
-
-/// Roots: heads of deleted or weight-increased tree edges.
-__global__ void markRootsKernel(const int *from, const int *to, int count,
-                                const int *parent, int *flag) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < count && parent[to[i]] == from[i]) {
-    flag[to[i]] = 1;
+  if ((threadIdx.x & 31) == 0 && value != PACKED_INF) {
+    atomicMin(target, value);
   }
 }
 
-__global__ void initAncestorsKernel(int n, const int *parent, int *ancestor) {
-  int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v < n) {
-    ancestor[v] = parent[v];
-  }
-}
+__global__ void __launch_bounds__(BLOCK_SIZE)
+    sospPersistentKernel(Params p) {
+  cg::grid_group grid = cg::this_grid();
+  const int tid = static_cast<int>(grid.thread_rank());
+  const int threads = static_cast<int>(grid.size());
+  const int n = p.out.numberOfNodes;
+  const Packing packing = p.packing;
+  Control *c = p.control;
+  int generation = p.generation;
+  int frontierCount = 0;
 
-/**
- * One pointer-jumping round. Invariant for every vertex x: flag[x] == 1
- * implies a root among x and its ancestors; flag[x] == 0 implies no root
- * on the tree path from x up to (excluding) ancestor[x]. A round either
- * inherits the ancestor's flag or jumps to the ancestor's ancestor, which
- * at least doubles the covered distance, so ceil(log2 n) rounds suffice.
- * Rounds update in place: every (ancestor, flag) value a thread can
- * observe satisfies the invariant, so the races are benign.
- */
-__global__ void pointerJumpKernel(int n, int *ancestor, int *flag) {
-  int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v >= n) {
-    return;
-  }
-  int a = ancestor[v];
-  if (a < 0 || flag[v]) {
-    return;
-  }
-  if (flag[a]) {
-    flag[v] = 1;
-    return;
-  }
-  ancestor[v] = ancestor[a];
-}
-
-/// Invalidate flagged vertices and list them as candidates.
-__global__ void invalidateKernel(int n, int *flag, u64 *packed, int *stamp,
-                                 int generation, int *list, int *counters) {
-  int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v >= n || !flag[v]) {
-    return;
-  }
-  flag[v] = 0; // leave the flag array clean for the next update
-  packed[v] = PACKED_INF;
-  stamp[v] = generation;
-  list[atomicAdd(&counters[LIST_COUNT], 1)] = v;
-}
-
-/// Add the heads of inserted edges to the candidate list (deduplicated).
-__global__ void addCandidatesKernel(const int *vertices, int count, int source,
-                                    int *stamp, int generation, int *list,
-                                    int *counters) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count) {
-    return;
-  }
-  int v = vertices[i];
-  if (v != source && claim(stamp, v, generation)) {
-    list[atomicAdd(&counters[LIST_COUNT], 1)] = v;
-  }
-}
-
-/// Pull pass: candidate v takes the best (distance, id) over its
-/// in-neighbours; improved vertices form the first frontier.
-__global__ void pullKernel(const int *candidates, int count, DeviceCsr in,
-                           u64 *packed, Packing packing, int *stamp,
-                           int generation, int *frontier, int *counters) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count) {
-    return;
-  }
-  int v = candidates[i];
-  u64 current = __ldcg(&packed[v]);
-  u64 best = current;
-  for (int e = in.rowPtr[v]; e < in.rowPtr[v + 1]; ++e) {
-    int u = in.colInd[e];
-    u64 word = __ldcg(&packed[u]);
-    if (word == PACKED_INF) {
-      continue;
+  if (p.fromScratch) {
+    // ---- From scratch: only the source is finite. -------------------------
+    for (int v = tid; v < n; v += threads) {
+      p.packed[v] = v == p.source ? packing.pack(0, -1) : PACKED_INF;
     }
-    u64 candidate = packing.pack(packing.distance(word) + in.weights[e], u);
-    best = min(best, candidate);
-  }
-  if (best < current) {
-    u64 old = atomicMin(&packed[v], best);
-    if (packing.distance(best) < packing.distance(old) &&
-        claim(stamp, v, generation)) {
-      frontier[atomicAdd(&counters[LIST_COUNT], 1)] = v;
+    if (tid == 0) {
+      p.frontier[0] = p.source;
     }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Step 2 kernels (near-far push)
-// ---------------------------------------------------------------------------
-
-/**
- * Relax the out-edges of the near frontier. An improved head joins the next
- * near frontier (distance below the threshold, deduplicated by stamp) or
- * the far pile (deduplicated by the inFar flag). Thread 0 also zeroes the
- * counter the next iteration will write to.
- */
-__global__ void pushKernel(const int *nearList, int nearCount, DeviceCsr out,
-                           u64 *packed, Packing packing, int *stamp,
-                           int generation, int *nextNear, int nearSlot,
-                           int *inFar, int *far, u64 threshold, int source,
-                           int resetSlot, int *counters) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i == 0) {
-    counters[resetSlot] = 0;
-  }
-  if (i >= nearCount) {
-    return;
-  }
-  int u = nearList[i];
-  u64 word = __ldcg(&packed[u]);
-  if (word == PACKED_INF) {
-    return;
-  }
-  u64 du = packing.distance(word);
-  for (int e = out.rowPtr[u]; e < out.rowPtr[u + 1]; ++e) {
-    int w = out.colInd[e];
-    if (w == source) {
-      continue;
+    frontierCount = 1;
+    grid.sync();
+  } else {
+    // ---- Pack the old tree; roots; ancestors. -----------------------------
+    for (int v = tid; v < n; v += threads) {
+      long long d = p.distances[v];
+      if (d >= DISTANCE_INF / 2) {
+        p.packed[v] = PACKED_INF;
+      } else if (d < 0 || static_cast<u64>(d) > p.maxDistance) {
+        c->overflow = 1;
+        p.packed[v] = PACKED_INF;
+      } else {
+        p.packed[v] = packing.pack(static_cast<u64>(d), p.parent[v]);
+      }
+      p.ancestor[v] = p.parent[v];
     }
-    u64 nd = du + out.weights[e];
-    u64 candidate = packing.pack(nd, u);
-    if (candidate >= __ldcg(&packed[w])) {
-      continue;
-    }
-    u64 old = atomicMin(&packed[w], candidate);
-    if (nd < packing.distance(old)) {
-      if (nd < threshold) {
-        if (claim(stamp, w, generation)) {
-          nextNear[atomicAdd(&counters[nearSlot], 1)] = w;
-        }
-      } else if (atomicExch(&inFar[w], 1) == 0) {
-        far[atomicAdd(&counters[FAR_COUNT], 1)] = w;
+    for (int i = tid; i < p.changes.numberOfChanged; i += threads) {
+      int v = p.changes.changedTo[i];
+      if (p.parent[v] == p.changes.changedFrom[i]) {
+        p.flag[v] = 1;
       }
     }
-  }
-}
+    grid.sync();
 
-/// Smallest distance over a vertex list (warp-reduced atomicMin).
-__global__ void minDistanceKernel(const int *list, int count,
-                                  const u64 *packed, Packing packing,
-                                  u64 *minimum) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  u64 d = PACKED_INF;
-  if (i < count) {
-    u64 word = __ldcg(&packed[list[i]]);
+    // ---- Subtree invalidation by pointer jumping. -------------------------
+    // Invariant for every vertex x: flag[x] == 1 implies a root among x and
+    // its ancestors; flag[x] == 0 implies no root on the tree path from x up
+    // to (excluding) ancestor[x]. A vertex either inherits its ancestor's
+    // flag or jumps to the ancestor's ancestor, at least doubling the
+    // covered distance, so ceil(log2 n) rounds suffice; the loop stops
+    // earlier once no vertex is still jumping. Only v's thread writes
+    // (ancestor[v], flag[v]) and every value another thread can observe
+    // satisfies the invariant, so updating in place is safe.
+    if (p.changes.numberOfChanged > 0) {
+      for (int round = 0; round < p.maxRounds; ++round) {
+        if (tid == 0) {
+          c->active[(round + 1) % 3] = 0; // slot of the next round
+          c->rounds = round + 1;
+        }
+        int jumping = 0;
+        for (int v = tid; v < n; v += threads) {
+          int a = load(&p.ancestor[v]);
+          if (a < 0 || load(&p.flag[v])) {
+            continue;
+          }
+          if (load(&p.flag[a])) {
+            p.flag[v] = 1;
+            continue;
+          }
+          int next = load(&p.ancestor[a]);
+          p.ancestor[v] = next;
+          jumping |= next >= 0 ? 1 : 0;
+        }
+        if (__any_sync(0xffffffffu, jumping) && (threadIdx.x & 31) == 0) {
+          c->active[round % 3] = 1;
+        }
+        grid.sync();
+        if (load(&c->active[round % 3]) == 0) {
+          break;
+        }
+      }
+    }
+
+    // ---- Invalidate; candidates = invalidated + insert heads. ------------
+    ++generation;
+    for (int v = tid; v < n; v += threads) {
+      if (load(&p.flag[v])) {
+        p.flag[v] = 0; // leave the flags clean for the next update
+        p.packed[v] = PACKED_INF;
+        p.stamp[v] = generation;
+        p.candidates[atomicAdd(&c->listCount, 1)] = v;
+      }
+    }
+    grid.sync();
+    if (tid == 0) {
+      c->invalidated = load(&c->listCount);
+    }
+    for (int i = tid; i < p.changes.numberOfInsertHeads; i += threads) {
+      int v = p.changes.insertHeads[i];
+      if (v != p.source && claim(p.stamp, v, generation)) {
+        p.candidates[atomicAdd(&c->listCount, 1)] = v;
+      }
+    }
+    grid.sync();
+
+    // ---- Pull pass. -------------------------------------------------------
+    ++generation;
+    const int candidateCount = load(&c->listCount);
+    for (int i = tid; i < candidateCount; i += threads) {
+      int v = load(&p.candidates[i]);
+      u64 current = load(&p.packed[v]);
+      u64 best = current;
+      for (int e = p.in.rowPtr[v]; e < p.in.rowPtr[v + 1]; ++e) {
+        int u = p.in.colInd[e];
+        u64 word = load(&p.packed[u]);
+        if (word != PACKED_INF) {
+          best = min(best,
+                     packing.pack(packing.distance(word) +
+                                      static_cast<u64>(p.in.weights[e]),
+                                  u));
+        }
+      }
+      if (best < current) {
+        u64 old = atomicMin(&p.packed[v], best);
+        if (packing.distance(best) < packing.distance(old) &&
+            claim(p.stamp, v, generation)) {
+          p.frontier[atomicAdd(&c->frontierCount, 1)] = v;
+        }
+      }
+    }
+    grid.sync();
+    frontierCount = load(&c->frontierCount);
+  }
+
+  // ---- Near-far propagation. ----------------------------------------------
+  // Threshold = smallest frontier distance + delta.
+  u64 local = PACKED_INF;
+  for (int i = tid; i < frontierCount; i += threads) {
+    u64 word = load(&p.packed[load(&p.frontier[i])]);
     if (word != PACKED_INF) {
-      d = packing.distance(word);
+      local = min(local, packing.distance(word));
     }
   }
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    d = min(d, __shfl_down_sync(0xffffffffu, d, offset));
-  }
-  if ((threadIdx.x & 31) == 0 && d != PACKED_INF) {
-    atomicMin(minimum, d);
-  }
-}
+  minimumInto(local, &c->minimum);
+  grid.sync();
+  const u64 smallest = load(&c->minimum);
+  u64 threshold = (smallest == PACKED_INF ? 0 : smallest) + p.delta;
 
-/**
- * Split a list by the threshold: below goes to the near frontier, the rest
- * to the far pile. For the first split (fromFar = false) the far pile is
- * deduplicated with the inFar flag; when re-splitting the far pile the
- * flags are already set and are cleared for vertices leaving it.
- */
-__global__ void splitKernel(const int *list, int count, const u64 *packed,
-                            Packing packing, u64 threshold, int *stamp,
-                            int generation, int *nearList, int nearSlot,
-                            int *inFar, int *far, bool fromFar,
-                            int *counters) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count) {
-    return;
+  // Every phase that produces a near list appends to nearCount[phase % 3];
+  // at its start thread 0 zeroes the slot of the following phase, which was
+  // last used two phases ago and read by everybody before the previous
+  // barrier.
+  int phase = 0;
+  int *current = p.nearA, *next = p.nearB, *far = p.farA, *far2 = p.farB;
+  ++generation;
+  if (tid == 0) {
+    c->nearCount[1] = 0;
   }
-  int v = list[i];
-  u64 word = __ldcg(&packed[v]);
-  u64 d = word == PACKED_INF ? PACKED_INF : packing.distance(word);
-  if (d < threshold) {
-    if (fromFar) {
-      inFar[v] = 0;
+  for (int i = tid; i < frontierCount; i += threads) {
+    int v = load(&p.frontier[i]);
+    u64 word = load(&p.packed[v]);
+    u64 d = word == PACKED_INF ? PACKED_INF : packing.distance(word);
+    if (d < threshold) {
+      if (claim(p.stamp, v, generation)) {
+        current[atomicAdd(&c->nearCount[0], 1)] = v;
+      }
+    } else if (atomicExch(&p.inFar[v], 1) == 0) {
+      far[atomicAdd(&c->farCount, 1)] = v;
     }
-    if (claim(stamp, v, generation)) {
-      nearList[atomicAdd(&counters[nearSlot], 1)] = v;
-    }
-  } else if (fromFar || atomicExch(&inFar[v], 1) == 0) {
-    far[atomicAdd(&counters[FAR_COUNT], 1)] = v;
   }
-}
+  grid.sync();
+  if (tid == 0) {
+    c->minimum = PACKED_INF; // everybody read it before the barrier
+  }
+  int nearCount = load(&c->nearCount[0]);
+  int iterations = 0, epochs = 0;
+  long long pushes = 0;
 
-__global__ void initFromScratchKernel(int n, u64 *packed, int source,
-                                      Packing packing) {
-  int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v < n) {
-    packed[v] = v == source ? packing.pack(0, -1) : PACKED_INF;
+  while (true) {
+    if (nearCount > 0) {
+      // -- One push iteration over the near frontier. --
+      ++phase;
+      ++generation;
+      ++iterations;
+      pushes += nearCount;
+      if (tid == 0) {
+        c->nearCount[(phase + 1) % 3] = 0;
+      }
+      int *slot = &c->nearCount[phase % 3];
+      for (int i = tid; i < nearCount; i += threads) {
+        int u = load(&current[i]);
+        u64 word = load(&p.packed[u]);
+        if (word == PACKED_INF) {
+          continue;
+        }
+        u64 du = packing.distance(word);
+        for (int e = p.out.rowPtr[u]; e < p.out.rowPtr[u + 1]; ++e) {
+          int w = p.out.colInd[e];
+          if (w == p.source) {
+            continue;
+          }
+          u64 nd = du + static_cast<u64>(p.out.weights[e]);
+          u64 candidate = packing.pack(nd, u);
+          if (candidate >= load(&p.packed[w])) {
+            continue;
+          }
+          u64 old = atomicMin(&p.packed[w], candidate);
+          if (nd < packing.distance(old)) {
+            if (nd < threshold) {
+              if (claim(p.stamp, w, generation)) {
+                next[atomicAdd(slot, 1)] = w;
+              }
+            } else if (atomicExch(&p.inFar[w], 1) == 0) {
+              far[atomicAdd(&c->farCount, 1)] = w;
+            }
+          }
+        }
+      }
+      grid.sync();
+      nearCount = load(slot);
+      int *t = current;
+      current = next;
+      next = t;
+      continue;
+    }
+
+    // -- Near frontier empty: raise the threshold past the far pile. --
+    const int farCount = load(&c->farCount);
+    if (farCount == 0) {
+      break;
+    }
+    ++epochs;
+    local = PACKED_INF;
+    for (int i = tid; i < farCount; i += threads) {
+      u64 word = load(&p.packed[load(&far[i])]);
+      if (word != PACKED_INF) {
+        local = min(local, packing.distance(word));
+      }
+    }
+    minimumInto(local, &c->minimum);
+    grid.sync();
+    threshold = max(threshold, load(&c->minimum)) + p.delta;
+    ++phase;
+    ++generation;
+    if (tid == 0) {
+      c->nearCount[(phase + 1) % 3] = 0;
+    }
+    int *slot = &c->nearCount[phase % 3];
+    for (int i = tid; i < farCount; i += threads) {
+      int v = load(&far[i]);
+      u64 word = load(&p.packed[v]);
+      u64 d = word == PACKED_INF ? PACKED_INF : packing.distance(word);
+      if (d < threshold) {
+        p.inFar[v] = 0;
+        if (claim(p.stamp, v, generation)) {
+          current[atomicAdd(slot, 1)] = v;
+        }
+      } else {
+        far2[atomicAdd(&c->far2Count, 1)] = v;
+      }
+    }
+    grid.sync();
+    nearCount = load(slot);
+    if (tid == 0) {
+      c->farCount = load(&c->far2Count);
+      c->far2Count = 0;
+      c->minimum = PACKED_INF;
+    }
+    int *t = far;
+    far = far2;
+    far2 = t;
+    grid.sync(); // farCount is updated before the next push appends to it
+  }
+
+  // ---- Unpack the result. ---------------------------------------------------
+  for (int v = tid; v < n; v += threads) {
+    u64 word = load(&p.packed[v]);
+    if (word == PACKED_INF) {
+      p.distances[v] = DISTANCE_INF;
+      p.parent[v] = -1;
+    } else {
+      p.distances[v] = static_cast<long long>(packing.distance(word));
+      p.parent[v] = packing.parent(word);
+    }
+  }
+  if (tid == 0) {
+    c->iterations = iterations;
+    c->epochs = epochs;
+    c->pushes = pushes;
+    c->generation = generation;
   }
 }
 
@@ -381,18 +476,17 @@ void SospWorkspace::release() {
   cudaFree(farA);
   cudaFree(farB);
   cudaFree(candidates);
-  cudaFree(counters);
-  cudaFree(minimum);
-  cudaFreeHost(hostCounters);
-  cudaFreeHost(hostMinimum);
+  cudaFree(frontier);
+  cudaFree(control);
+  cudaFreeHost(hostControl);
   packed = nullptr;
   stamp = inFar = flag = ancestor = nullptr;
-  listA = listB = farA = farB = candidates = counters = nullptr;
-  minimum = nullptr;
-  hostCounters = nullptr;
-  hostMinimum = nullptr;
+  listA = listB = farA = farB = candidates = frontier = nullptr;
+  control = nullptr;
+  hostControl = nullptr;
   capacity = 0;
   generation = 0;
+  gridBlocks = 0;
 }
 
 bool SospWorkspace::reserve(int requested) {
@@ -400,6 +494,22 @@ bool SospWorkspace::reserve(int requested) {
     return true;
   }
   release();
+  int device = 0, cooperative = 0, sms = 0, perSm = 0;
+  GPU_CHECK(cudaGetDevice(&device));
+  GPU_CHECK(cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch,
+                                   device));
+  if (!cooperative) {
+    cerr << "Error: the GPU does not support cooperative launches.\n";
+    return false;
+  }
+  GPU_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
+                                   device));
+  GPU_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &perSm, sospPersistentKernel, BLOCK_SIZE, 0));
+  if (perSm < 1) {
+    cerr << "Error: the persistent kernel does not fit on an SM.\n";
+    return false;
+  }
   const size_t n = static_cast<size_t>(max(requested, 1));
   GPU_CHECK(cudaMalloc(&packed, n * sizeof(u64)));
   GPU_CHECK(cudaMalloc(&stamp, n * sizeof(int)));
@@ -411,20 +521,22 @@ bool SospWorkspace::reserve(int requested) {
   GPU_CHECK(cudaMalloc(&farA, n * sizeof(int)));
   GPU_CHECK(cudaMalloc(&farB, n * sizeof(int)));
   GPU_CHECK(cudaMalloc(&candidates, n * sizeof(int)));
-  GPU_CHECK(cudaMalloc(&counters, NUM_COUNTERS * sizeof(int)));
-  GPU_CHECK(cudaMalloc(&minimum, sizeof(u64)));
-  GPU_CHECK(cudaMallocHost(&hostCounters, NUM_COUNTERS * sizeof(int)));
-  GPU_CHECK(cudaMallocHost(&hostMinimum, sizeof(u64)));
+  GPU_CHECK(cudaMalloc(&frontier, n * sizeof(int)));
+  GPU_CHECK(cudaMalloc(&control, sizeof(Control)));
+  GPU_CHECK(cudaMallocHost(&hostControl, sizeof(Control)));
   GPU_CHECK(cudaMemset(stamp, 0, n * sizeof(int)));
   GPU_CHECK(cudaMemset(inFar, 0, n * sizeof(int)));
   GPU_CHECK(cudaMemset(flag, 0, n * sizeof(int)));
   capacity = requested;
   generation = 0;
+  gridBlocks = perSm * sms;
   return true;
 }
 
 int SospWorkspace::nextGeneration() {
-  if (generation == INT_MAX) {
+  // An update uses a few generations plus one per push iteration and
+  // threshold increase; restart well before the counter could wrap.
+  if (generation > INT_MAX / 2) {
     cudaMemset(stamp, 0, static_cast<size_t>(capacity) * sizeof(int));
     generation = 0;
   }
@@ -443,99 +555,63 @@ long long defaultDelta(long long numberOfEdges, int numberOfNodes,
 }
 
 // ============================================================================
-// Near-far loop (shared by the update and the from-scratch search)
+// Public entry points
 // ============================================================================
 
 namespace {
 
-/**
- * Run the near-far propagation from the vertices in @p frontier (a list in
- * ws.listB). One blocking host synchronization per push iteration and two
- * per threshold increase.
- */
-bool nearFar(const DeviceCsr &out, int source, u64 delta, Packing packing,
-             SospWorkspace &ws, int frontierCount, SospStats &stats) {
-  if (frontierCount == 0) {
-    return true;
+bool runPersistent(Params &params, SospWorkspace &ws, SospStats &stats) {
+  params.packed = ws.packed;
+  params.stamp = ws.stamp;
+  params.inFar = ws.inFar;
+  params.flag = ws.flag;
+  params.ancestor = ws.ancestor;
+  params.candidates = ws.candidates;
+  params.frontier = ws.frontier;
+  params.nearA = ws.listA;
+  params.nearB = ws.listB;
+  params.farA = ws.farA;
+  params.farB = ws.farB;
+  params.control = static_cast<Control *>(ws.control);
+  params.generation = ws.nextGeneration();
+
+  Control initial{};
+  initial.minimum = PACKED_INF;
+  GPU_CHECK(cudaMemcpyAsync(ws.control, &initial, sizeof(Control),
+                            cudaMemcpyHostToDevice));
+  void *args[] = {&params};
+  GPU_CHECK(cudaLaunchCooperativeKernel(
+      reinterpret_cast<void *>(sospPersistentKernel), ws.gridBlocks,
+      BLOCK_SIZE, args, 0, 0));
+  GPU_CHECK(cudaMemcpyAsync(ws.hostControl, ws.control, sizeof(Control),
+                            cudaMemcpyDeviceToHost));
+  GPU_CHECK(cudaStreamSynchronize(0));
+  const Control &result = *static_cast<const Control *>(ws.hostControl);
+  if (result.overflow) {
+    cerr << "Error: an input distance does not fit the packed format.\n";
+    return false;
   }
-  int *frontier = ws.listB;
-  // Threshold = smallest frontier distance + delta.
-  *ws.hostMinimum = PACKED_INF;
-  GPU_CHECK(cudaMemcpy(ws.minimum, ws.hostMinimum, sizeof(u64),
-                       cudaMemcpyHostToDevice));
-  minDistanceKernel<<<blocks(frontierCount), BLOCK_SIZE>>>(
-      frontier, frontierCount, ws.packed, packing, ws.minimum);
-  GPU_CHECK(cudaMemcpy(ws.hostMinimum, ws.minimum, sizeof(u64),
-                       cudaMemcpyDeviceToHost));
-  u64 threshold =
-      (*ws.hostMinimum == PACKED_INF ? 0 : *ws.hostMinimum) + delta;
+  ws.generation = max(ws.generation, result.generation);
+  stats.invalidated = result.invalidated;
+  stats.jumpRounds = result.rounds;
+  stats.iterations = result.iterations;
+  stats.epochs = result.epochs;
+  stats.pushes = result.pushes;
+  return true;
+}
 
-  int *current = ws.candidates, *next = ws.listA;
-  int *far = ws.farA, *far2 = ws.farB;
-  GPU_CHECK(cudaMemset(ws.counters, 0, NUM_COUNTERS * sizeof(int)));
-  splitKernel<<<blocks(frontierCount), BLOCK_SIZE>>>(
-      frontier, frontierCount, ws.packed, packing, threshold, ws.stamp,
-      ws.nextGeneration(), current, NEAR_A, ws.inFar, far, false,
-      ws.counters);
-  GPU_CHECK(cudaMemcpy(ws.hostCounters, ws.counters, 3 * sizeof(int),
-                       cudaMemcpyDeviceToHost));
-  int nearCount = ws.hostCounters[NEAR_A];
-  int farCount = ws.hostCounters[FAR_COUNT];
-  int nearSlot = NEAR_A;
-
-  while (nearCount > 0 || farCount > 0) {
-    while (nearCount > 0) {
-      ++stats.iterations;
-      stats.pushes += nearCount;
-      // The kernel appends to counters[outSlot] (zeroed by the previous
-      // iteration) and zeroes counters[nearSlot] for the next one, so each
-      // iteration needs a single blocking copy of the counters.
-      const int outSlot = nearSlot == NEAR_A ? NEAR_B : NEAR_A;
-      pushKernel<<<blocks(nearCount), BLOCK_SIZE>>>(
-          current, nearCount, out, ws.packed, packing, ws.stamp,
-          ws.nextGeneration(), next, outSlot, ws.inFar, far, threshold,
-          source, nearSlot, ws.counters);
-      GPU_CHECK(cudaGetLastError());
-      GPU_CHECK(cudaMemcpy(ws.hostCounters, ws.counters, 3 * sizeof(int),
-                           cudaMemcpyDeviceToHost));
-      nearCount = ws.hostCounters[outSlot];
-      farCount = ws.hostCounters[FAR_COUNT];
-      nearSlot = outSlot;
-      swap(current, next);
-    }
-    if (farCount == 0) {
-      break;
-    }
-    // Move the threshold past the smallest far distance and re-split.
-    ++stats.epochs;
-    *ws.hostMinimum = PACKED_INF;
-    GPU_CHECK(cudaMemcpy(ws.minimum, ws.hostMinimum, sizeof(u64),
-                         cudaMemcpyHostToDevice));
-    minDistanceKernel<<<blocks(farCount), BLOCK_SIZE>>>(
-        far, farCount, ws.packed, packing, ws.minimum);
-    GPU_CHECK(cudaMemcpy(ws.hostMinimum, ws.minimum, sizeof(u64),
-                         cudaMemcpyDeviceToHost));
-    threshold = max(threshold, *ws.hostMinimum) + delta;
-    GPU_CHECK(cudaMemset(ws.counters, 0, 3 * sizeof(int)));
-    splitKernel<<<blocks(farCount), BLOCK_SIZE>>>(
-        far, farCount, ws.packed, packing, threshold, ws.stamp,
-        ws.nextGeneration(), current, NEAR_A, ws.inFar, far2, true,
-        ws.counters);
-    GPU_CHECK(cudaMemcpy(ws.hostCounters, ws.counters, 3 * sizeof(int),
-                         cudaMemcpyDeviceToHost));
-    nearCount = ws.hostCounters[NEAR_A];
-    farCount = ws.hostCounters[FAR_COUNT];
-    nearSlot = NEAR_A;
-    swap(far, far2);
+bool checkPacking(int n, long long maxWeight, const Packing &packing,
+                  u64 &bound) {
+  bound = static_cast<u64>(max(maxWeight, 1LL)) * static_cast<u64>(n - 1);
+  if (bound > packing.maxDistance()) {
+    cerr << "Error: distances up to " << bound << " do not fit the packed "
+         << (64 - packing.parentBits) << "-bit distance field.\n";
+    return false;
   }
   return true;
 }
 
 } // namespace
-
-// ============================================================================
-// Public entry points
-// ============================================================================
 
 bool sospUpdateGpu(const DeviceCsr &out, const DeviceCsr &in,
                    const DeviceChanges &changes, int source, long long delta,
@@ -551,85 +627,25 @@ bool sospUpdateGpu(const DeviceCsr &out, const DeviceCsr &in,
   if (!ws.reserve(n) || delta <= 0) {
     return false;
   }
-  const Packing packing = makePacking(n);
-  const u64 bound = static_cast<u64>(max(maxWeight, 1LL)) * (n - 1);
-  if (bound > packing.maxDistance()) {
-    cerr << "Error: distances up to " << bound << " do not fit the packed "
-         << (64 - packing.parentBits) << "-bit distance field.\n";
+  Params params{};
+  params.packing = makePacking(n);
+  if (!checkPacking(n, maxWeight, params.packing, params.maxDistance)) {
     return false;
   }
-
-  GPU_CHECK(cudaMemset(ws.counters, 0, NUM_COUNTERS * sizeof(int)));
-  packKernel<<<blocks(n), BLOCK_SIZE>>>(n, d_distances, d_parent, ws.packed,
-                                        packing, bound, ws.counters);
-
-  // --- Step 1: roots and subtree invalidation -------------------------------
-  if (changes.numberOfChanged > 0) {
-    ScopedStage stage("invalidate");
-    markRootsKernel<<<blocks(changes.numberOfChanged), BLOCK_SIZE>>>(
-        changes.changedFrom, changes.changedTo, changes.numberOfChanged,
-        d_parent, ws.flag);
-    initAncestorsKernel<<<blocks(n), BLOCK_SIZE>>>(n, d_parent, ws.ancestor);
-    int rounds = 0;
-    while ((1LL << rounds) < n) {
-      ++rounds;
-    }
-    for (int r = 0; r < rounds; ++r) {
-      pointerJumpKernel<<<blocks(n), BLOCK_SIZE>>>(n, ws.ancestor, ws.flag);
-    }
-    const int generation = ws.nextGeneration();
-    invalidateKernel<<<blocks(n), BLOCK_SIZE>>>(n, ws.flag, ws.packed,
-                                                ws.stamp, generation,
-                                                ws.candidates, ws.counters);
-    GPU_CHECK(cudaGetLastError());
-    GPU_CHECK(cudaMemcpy(ws.hostCounters, ws.counters,
-                         NUM_COUNTERS * sizeof(int), cudaMemcpyDeviceToHost));
-    s.invalidated = ws.hostCounters[LIST_COUNT];
-    if (changes.numberOfInsertHeads > 0) {
-      addCandidatesKernel<<<blocks(changes.numberOfInsertHeads), BLOCK_SIZE>>>(
-          changes.insertHeads, changes.numberOfInsertHeads, source, ws.stamp,
-          generation, ws.candidates, ws.counters);
-    }
-  } else if (changes.numberOfInsertHeads > 0) {
-    addCandidatesKernel<<<blocks(changes.numberOfInsertHeads), BLOCK_SIZE>>>(
-        changes.insertHeads, changes.numberOfInsertHeads, source, ws.stamp,
-        ws.nextGeneration(), ws.candidates, ws.counters);
+  int rounds = 0;
+  while ((1LL << rounds) < n) {
+    ++rounds;
   }
-  GPU_CHECK(cudaGetLastError());
-  GPU_CHECK(cudaMemcpy(ws.hostCounters, ws.counters,
-                       NUM_COUNTERS * sizeof(int), cudaMemcpyDeviceToHost));
-  if (ws.hostCounters[OVERFLOW] != 0) {
-    cerr << "Error: an initial distance does not fit the packed format.\n";
-    return false;
-  }
-  const int numberOfCandidates = ws.hostCounters[LIST_COUNT];
-
-  // --- Step 1: pull pass over invalidated vertices and insert heads --------
-  int frontierCount = 0;
-  if (numberOfCandidates > 0) {
-    ScopedStage stage("pull");
-    GPU_CHECK(cudaMemset(ws.counters + LIST_COUNT, 0, sizeof(int)));
-    pullKernel<<<blocks(numberOfCandidates), BLOCK_SIZE>>>(
-        ws.candidates, numberOfCandidates, in, ws.packed, packing,
-        ws.stamp, ws.nextGeneration(), ws.listB, ws.counters);
-    GPU_CHECK(cudaGetLastError());
-    GPU_CHECK(cudaMemcpy(ws.hostCounters, ws.counters,
-                         NUM_COUNTERS * sizeof(int), cudaMemcpyDeviceToHost));
-    frontierCount = ws.hostCounters[LIST_COUNT];
-  }
-
-  // --- Step 2: near-far propagation ----------------------------------------
-  {
-    ScopedStage stage("near_far");
-    if (!nearFar(out, source, static_cast<u64>(delta), packing, ws,
-                 frontierCount, s)) {
-      return false;
-    }
-  }
-  unpackKernel<<<blocks(n), BLOCK_SIZE>>>(n, ws.packed, d_distances,
-                                          d_parent, packing);
-  GPU_CHECK(cudaGetLastError());
-  return true;
+  params.out = out;
+  params.in = in;
+  params.changes = changes;
+  params.source = source;
+  params.fromScratch = false;
+  params.delta = static_cast<u64>(delta);
+  params.maxRounds = rounds + 1;
+  params.distances = d_distances;
+  params.parent = d_parent;
+  return runPersistent(params, ws, s);
 }
 
 bool sospFromScratchGpu(const DeviceCsr &out, int source, long long delta,
@@ -646,22 +662,17 @@ bool sospFromScratchGpu(const DeviceCsr &out, int source, long long delta,
   if (!ws.reserve(n) || delta <= 0 || source < 0 || source >= n) {
     return false;
   }
-  const Packing packing = makePacking(n);
-  const u64 bound = static_cast<u64>(max(maxWeight, 1LL)) * (n - 1);
-  if (bound > packing.maxDistance()) {
-    cerr << "Error: distances up to " << bound << " do not fit the packed "
-         << (64 - packing.parentBits) << "-bit distance field.\n";
+  Params params{};
+  params.packing = makePacking(n);
+  if (!checkPacking(n, maxWeight, params.packing, params.maxDistance)) {
     return false;
   }
-  initFromScratchKernel<<<blocks(n), BLOCK_SIZE>>>(n, ws.packed, source,
-                                                   packing);
-  GPU_CHECK(cudaMemcpy(ws.listB, &source, sizeof(int),
-                       cudaMemcpyHostToDevice));
-  if (!nearFar(out, source, static_cast<u64>(delta), packing, ws, 1, s)) {
-    return false;
-  }
-  unpackKernel<<<blocks(n), BLOCK_SIZE>>>(n, ws.packed, d_distances,
-                                          d_parent, packing);
-  GPU_CHECK(cudaGetLastError());
-  return true;
+  params.out = out;
+  params.in = out;
+  params.source = source;
+  params.fromScratch = true;
+  params.delta = static_cast<u64>(delta);
+  params.distances = d_distances;
+  params.parent = d_parent;
+  return runPersistent(params, ws, s);
 }
