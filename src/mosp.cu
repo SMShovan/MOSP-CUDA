@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
     cout.setf(ios::unitbuf);
   }
   // Stage timers are always on in this driver: the GPU-compute scope is
-  // the sum of the propagation and reachability stages of every call.
+  // the sum of the GPU update stages (Steps 1 and 2) of every call.
   setInstrumentation(true);
   const string csv =
       opt.timingCsv.empty() ? opt.out + "/stages.csv" : opt.timingCsv;
@@ -196,8 +196,7 @@ int main(int argc, char **argv) {
   if (!opt.quiet) {
     printInstrumentation(cout);
   }
-  const double gpuCompute = totalStageTime("sosp/2c_propagate_gpu") +
-                            totalStageTime("sosp/3_bfs_reachability_gpu");
+  const double gpuCompute = totalStageTime("sosp/update_gpu");
   cout << "RESULT gpu_compute_ms=" << gpuCompute
        << " end_to_end_ms=" << endToEnd << "\n";
 

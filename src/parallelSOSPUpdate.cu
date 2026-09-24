@@ -12,42 +12,25 @@
  * Phase 0 (host): read the graph, the initial tree and the change batch and
  * apply the batch to forward/reverse adjacency lists.
  *
- * Step 1 (GPU, straight from the change list): the head v of every deleted
- * or weight-increased edge (u,v) with Parent[v] == u is a *root*. Every
- * vertex in the SOSP subtree of a root has lost its shortest path, so the
- * subtrees are invalidated (distance INF, parent -1) by pointer jumping
- * over the parent array (ceil(log2 n) rounds, no host synchronization).
- * The invalidated vertices and the heads of all inserted edges form the
- * first candidate set; each candidate pulls the best (distance, id) over
- * its in-neighbours in the updated graph, i.e. the changes are grouped by
- * destination vertex as in Step 0/1 of the thesis.
- *
- * Step 2 (GPU): the thesis' propagation loop -- collect the out-neighbours
- * of the affected vertices, re-evaluate each candidate over its
- * in-neighbours -- with a *monotone* update: a vertex only takes a strictly
- * better (distance, parent id) pair. Every distance is an upper bound that
- * only decreases (valid vertices keep an intact tree path, invalidated
- * ones start at INF), so the loop terminates without an iteration cap,
- * cannot "count to infinity" through a stale cycle, and vertices cut off
- * from the source stay at INF without a reachability post-pass.
- *
- * Race condition analysis:
- *   - flag arrays: atomicCAS deduplication; lists: atomicAdd compaction;
- *   - d_distances[v]/d_parent[v]: written only by the thread that owns
- *     candidate v (candidates are deduplicated);
- *   - reads of in-neighbour distances: benign race under chaotic
- *     Bellman-Ford semantics -- any change marks the neighbour affected,
- *     so v is re-evaluated in the next iteration;
- *   - pointer jumping: each vertex only reads its ancestors' (ancestor,
- *     flag) pairs and every value it can observe is valid (see
- *     pointerJumpKernel).
+ * Steps 1 and 2 run on the GPU in sospUpdateGpu() (sospUpdateGpu.cu):
+ *   - Step 1, straight from the change list: the head v of every deleted
+ *     or weight-increased edge (u,v) with Parent[v] == u is a root; the
+ *     SOSP subtrees of the roots are invalidated by pointer jumping; the
+ *     invalidated vertices and the heads of inserted edges pull the best
+ *     (distance, id) over their in-neighbours (grouped by destination).
+ *   - Step 2: a push-based near-far worklist with a packed 64-bit
+ *     atomicMin on (distance << b | parent) propagates the improvements.
+ *     Distances only decrease, so there is no iteration cap and no
+ *     reachability post-pass; only improved vertices are expanded.
  *
  * ============================================================================
  */
 
 #include "parallelSOSPUpdate.cuh"
 
+#include "deviceArray.cuh"
 #include "read.cuh"
+#include "sospUpdateGpu.cuh"
 #include "stageTimer.cuh"
 
 #include <cuda_runtime.h>
@@ -61,235 +44,6 @@
 #include <vector>
 
 using namespace std;
-
-// ============================================================================
-// CUDA ERROR CHECKING
-// ============================================================================
-
-#define CUDA_CHECK(call)                                                       \
-  do {                                                                         \
-    cudaError_t err = (call);                                                  \
-    if (err != cudaSuccess) {                                                  \
-      cerr << "CUDA error: " << cudaGetErrorString(err) << " at "             \
-           << __FILE__ << ":" << __LINE__ << "\n";                             \
-      return false;                                                            \
-    }                                                                          \
-  } while (0)
-
-// ============================================================================
-// CUDA KERNELS
-// ============================================================================
-
-/**
- * @brief Collect candidate vertices from affected vertices' out-neighbors.
- *
- * Each thread processes one affected vertex, iterates its out-neighbors
- * in the CSR, and uses atomicCAS for deduplication and atomicAdd for
- * worklist compaction.
- *
- * @param d_affectedList    Array of affected vertex indices.
- * @param numAffected       Number of affected vertices.
- * @param d_outRowPtr       CSR row pointer for forward graph.
- * @param d_outColInd       CSR column indices for forward graph.
- * @param d_isCandidate     Flag array for deduplication (0/1).
- * @param d_candidateList   Output worklist of candidate vertices.
- * @param d_candidateCount  Atomic counter for candidateList size.
- * @param d_isAffected      Flag array for affected vertices (cleared here).
- * @param source            Source vertex (never becomes a candidate).
- */
-__global__ void collectCandidatesKernel(
-    const int *d_affectedList, int numAffected, const int *d_outRowPtr,
-    const int *d_outColInd, int *d_isCandidate, int *d_candidateList,
-    int *d_candidateCount, int *d_isAffected, int source) {
-
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= numAffected)
-    return;
-
-  int affectedVertex = d_affectedList[tid];
-  d_isAffected[affectedVertex] = 0; // Clear affected flag
-
-  int rowStart = d_outRowPtr[affectedVertex];
-  int rowEnd = d_outRowPtr[affectedVertex + 1];
-
-  for (int e = rowStart; e < rowEnd; ++e) {
-    int neighborVertex = d_outColInd[e];
-
-    // CRITICAL: Never update the source vertex
-    if (neighborVertex == source)
-      continue;
-
-    // Atomic test-and-set for deduplication
-    int old = atomicCAS(&d_isCandidate[neighborVertex], 0, 1);
-    if (old == 0) {
-      int pos = atomicAdd(d_candidateCount, 1);
-      d_candidateList[pos] = neighborVertex;
-    }
-  }
-}
-
-/**
- * @brief Re-evaluate candidate vertices over their in-neighbours
- *        (monotone: keep the old value unless strictly better).
- *
- * Each thread processes one candidate vertex and computes the best
- * (distance, parent id) pair over its in-neighbours; ties go to the lowest
- * parent id. The pair replaces the current one only if it is smaller in
- * that order. If the distance decreased, the vertex becomes affected.
- *
- * @param d_candidateList   Array of candidate vertex indices.
- * @param numCandidates     Number of candidate vertices.
- * @param d_inRowPtr        CSR row pointer for reverse graph.
- * @param d_inColInd        CSR column indices for reverse graph.
- * @param d_inWeights       CSR edge weights for reverse graph.
- * @param d_distances       Distance array (read/write).
- * @param d_parent          Parent array (read/write).
- * @param d_isAffected      Flag array for newly affected vertices.
- * @param d_affectedList    Output worklist of newly affected vertices.
- * @param d_affectedCount   Atomic counter for affectedList size.
- * @param INF_VALUE         Sentinel value for unreachable vertices.
- */
-__global__ void updateDistancesKernel(
-    const int *d_candidateList, int numCandidates, const int *d_inRowPtr,
-    const int *d_inColInd, const long long *d_inWeights,
-    long long *d_distances, int *d_parent, int *d_isAffected,
-    int *d_affectedList, int *d_affectedCount, long long INF_VALUE) {
-
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= numCandidates)
-    return;
-
-  int candidateVertex = d_candidateList[tid];
-
-  // Start from the current value: the update is monotone.
-  const long long currentDistance = d_distances[candidateVertex];
-  const int currentParent = d_parent[candidateVertex];
-  long long bestDistance = currentDistance;
-  int bestParent = currentParent;
-
-  int rowStart = d_inRowPtr[candidateVertex];
-  int rowEnd = d_inRowPtr[candidateVertex + 1];
-
-  for (int e = rowStart; e < rowEnd; ++e) {
-    int candidateParent = d_inColInd[e];
-    long long candidateWeight = d_inWeights[e];
-
-    // Skip unreachable in-neighbors to avoid overflow
-    long long parentDist = d_distances[candidateParent];
-    if (parentDist >= INF_VALUE / 2)
-      continue;
-
-    long long candidateDistance = parentDist + candidateWeight;
-    // Ties go to the lowest parent id (canonical SOSP tree).
-    if (candidateDistance < bestDistance ||
-        (candidateDistance == bestDistance &&
-         (bestParent < 0 || candidateParent < bestParent))) {
-      bestDistance = candidateDistance;
-      bestParent = candidateParent;
-    }
-  }
-
-  if (bestParent == currentParent && bestDistance == currentDistance)
-    return;
-
-  // No race: each candidateVertex is unique in the list
-  d_parent[candidateVertex] = bestParent;
-  d_distances[candidateVertex] = bestDistance;
-
-  if (bestDistance < currentDistance) {
-    // Atomic test-and-set for deduplication in affected list
-    int old = atomicCAS(&d_isAffected[candidateVertex], 0, 1);
-    if (old == 0) {
-      int pos = atomicAdd(d_affectedCount, 1);
-      d_affectedList[pos] = candidateVertex;
-    }
-  }
-}
-
-/**
- * @brief Step 1: flag the head of every changed tree edge as a root.
- *
- * Edge (from[i], to[i]) was deleted or its weight increased. If it is the
- * tree edge of its head (parent[to] == from), the head and its SOSP
- * subtree lose their shortest paths.
- */
-__global__ void markRootsKernel(const int *d_from, const int *d_to, int count,
-                                const int *d_parent, int *d_invalid) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  int v = d_to[i];
-  if (d_parent[v] == d_from[i])
-    d_invalid[v] = 1;
-}
-
-/** @brief ancestor[v] = parent[v] (start of pointer jumping). */
-__global__ void initAncestorsKernel(int numberOfNodes, const int *d_parent,
-                                    int *d_ancestor) {
-  int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v < numberOfNodes)
-    d_ancestor[v] = d_parent[v];
-}
-
-/**
- * @brief One pointer-jumping round of subtree invalidation.
- *
- * Invariant for every vertex x: invalid[x] == 1 implies a root among x and
- * its ancestors; invalid[x] == 0 implies no root on the tree path from x
- * up to (excluding) ancestor[x]. A round either inherits the flag of the
- * current ancestor or jumps to the ancestor's ancestor, which at least
- * doubles the distance covered, so ceil(log2 n) rounds reach the tree
- * root. The rounds update in place; every (ancestor, flag) value a thread
- * can observe satisfies the invariant, so the races are benign.
- */
-__global__ void pointerJumpKernel(int numberOfNodes, int *d_ancestor,
-                                  int *d_invalid) {
-  int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v >= numberOfNodes)
-    return;
-  int a = d_ancestor[v];
-  if (a < 0 || d_invalid[v])
-    return;
-  if (d_invalid[a]) {
-    d_invalid[v] = 1;
-    return;
-  }
-  d_ancestor[v] = d_ancestor[a];
-}
-
-/**
- * @brief Invalidate flagged vertices (distance INF, parent -1) and make
- *        them the first candidates.
- */
-__global__ void invalidateKernel(int numberOfNodes, const int *d_invalid,
-                                 long long *d_distances, int *d_parent,
-                                 int *d_isCandidate, int *d_candidateList,
-                                 int *d_candidateCount, long long INF_VALUE) {
-  int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v >= numberOfNodes || !d_invalid[v])
-    return;
-  d_distances[v] = INF_VALUE;
-  d_parent[v] = -1;
-  d_isCandidate[v] = 1;
-  d_candidateList[atomicAdd(d_candidateCount, 1)] = v;
-}
-
-/**
- * @brief Add the heads of inserted edges to the candidate list (deduped).
- */
-__global__ void addCandidatesKernel(const int *d_vertices, int count,
-                                    int source, int *d_isCandidate,
-                                    int *d_candidateList,
-                                    int *d_candidateCount) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  int v = d_vertices[i];
-  if (v == source)
-    return;
-  if (atomicCAS(&d_isCandidate[v], 0, 1) == 0)
-    d_candidateList[atomicAdd(d_candidateCount, 1)] = v;
-}
 
 // ============================================================================
 // HOST HELPER FUNCTIONS
@@ -427,7 +181,7 @@ bool readParentFromFile(const string &path, vector<int> &parent,
  */
 void flattenToCSR(const vector<vector<WeightedNeighbor>> &adjacency,
                   vector<int> &rowPtr, vector<int> &colInd,
-                  vector<long long> &weights) {
+                  vector<int> &weights) {
   int n = static_cast<int>(adjacency.size());
   rowPtr.resize(n + 1);
   rowPtr[0] = 0;
@@ -443,7 +197,7 @@ void flattenToCSR(const vector<vector<WeightedNeighbor>> &adjacency,
     int offset = rowPtr[i];
     for (int j = 0; j < static_cast<int>(adjacency[i].size()); ++j) {
       colInd[offset + j] = adjacency[i][j].vertex;
-      weights[offset + j] = adjacency[i][j].weight;
+      weights[offset + j] = static_cast<int>(adjacency[i][j].weight);
     }
   }
 }
@@ -505,6 +259,12 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
   buildAdjacencyLists(originalGraph, objectiveIndex, outAdjacency, inAdjacency);
 
   originalGraph.clear();
+  long long maxWeight = 1;
+  for (const auto &row : outAdjacency) {
+    for (const auto &neighbor : row) {
+      maxWeight = max(maxWeight, neighbor.weight);
+    }
+  }
   adjacencyStage.stop();
 
   // --- 0c. Read original distances and parent arrays ---
@@ -643,240 +403,91 @@ bool parallelSOSPUpdate(const string &originalCsrPrefix,
 
   // --- Flatten adjacency lists to CSR for device transfer ---
   ScopedStage flattenStage("sosp/2a_flatten_csr_host");
-  vector<int> h_outRowPtr, h_outColInd;
-  vector<long long> h_outWeights;
+  vector<int> h_outRowPtr, h_outColInd, h_outWeights;
   flattenToCSR(outAdjacency, h_outRowPtr, h_outColInd, h_outWeights);
 
-  vector<int> h_inRowPtr, h_inColInd;
-  vector<long long> h_inWeights;
+  vector<int> h_inRowPtr, h_inColInd, h_inWeights;
   flattenToCSR(inAdjacency, h_inRowPtr, h_inColInd, h_inWeights);
 
   // Free host adjacency lists (no longer needed)
   outAdjacency.clear();
   inAdjacency.clear();
 
-  int outNnz = static_cast<int>(h_outColInd.size());
-  int inNnz = static_cast<int>(h_inColInd.size());
-  const int numChanged = static_cast<int>(changedFrom.size());
-  const int numInsertHeads = static_cast<int>(insertHeads.size());
+  // Near-far bucket width and the bound on distances (packed format).
+  long long weightSum = 0;
+  for (int w : h_outWeights) {
+    weightSum += w;
+    maxWeight = max(maxWeight, static_cast<long long>(w));
+  }
+  const long long delta = defaultDelta(
+      static_cast<long long>(h_outColInd.size()), numberOfNodes, weightSum);
   flattenStage.stop();
 
-  // --- Allocate device memory ---
+  // --- Allocate device memory and copy the data ---
   ScopedStage uploadStage("sosp/2b_alloc_h2d", true);
-  int *d_outRowPtr = nullptr, *d_outColInd = nullptr;
-  int *d_inRowPtr = nullptr, *d_inColInd = nullptr;
-  long long *d_inWeights = nullptr;
-  long long *d_distances = nullptr;
-  int *d_parent = nullptr;
-  int *d_isAffected = nullptr, *d_isCandidate = nullptr;
-  int *d_affectedList = nullptr, *d_candidateList = nullptr;
-  int *d_affectedCount = nullptr, *d_candidateCount = nullptr;
-  int *d_invalid = nullptr, *d_ancestor = nullptr;
-  int *d_changedFrom = nullptr, *d_changedTo = nullptr;
-  int *d_insertHeads = nullptr;
-
-  CUDA_CHECK(cudaMalloc(&d_outRowPtr, (numberOfNodes + 1) * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_outColInd, max(outNnz, 1) * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_inRowPtr, (numberOfNodes + 1) * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_inColInd, max(inNnz, 1) * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_inWeights, max(inNnz, 1) * sizeof(long long)));
-  CUDA_CHECK(cudaMalloc(&d_distances, numberOfNodes * sizeof(long long)));
-  CUDA_CHECK(cudaMalloc(&d_parent, numberOfNodes * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_isAffected, numberOfNodes * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_isCandidate, numberOfNodes * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_affectedList, numberOfNodes * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_candidateList, numberOfNodes * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_affectedCount, sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_candidateCount, sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_invalid, numberOfNodes * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_ancestor, numberOfNodes * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_changedFrom, max(numChanged, 1) * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_changedTo, max(numChanged, 1) * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_insertHeads, max(numInsertHeads, 1) * sizeof(int)));
-
-  // --- Copy data to device ---
-  CUDA_CHECK(cudaMemcpy(d_outRowPtr, h_outRowPtr.data(),
-                        (numberOfNodes + 1) * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  if (outNnz > 0) {
-    CUDA_CHECK(cudaMemcpy(d_outColInd, h_outColInd.data(),
-                          outNnz * sizeof(int), cudaMemcpyHostToDevice));
+  DeviceArray<int> d_outRowPtr, d_outColInd, d_outWeights;
+  DeviceArray<int> d_inRowPtr, d_inColInd, d_inWeights;
+  DeviceArray<int> d_changedFrom, d_changedTo, d_insertHeads, d_parent;
+  DeviceArray<long long> d_distances;
+  if (!d_outRowPtr.upload(h_outRowPtr) || !d_outColInd.upload(h_outColInd) ||
+      !d_outWeights.upload(h_outWeights) || !d_inRowPtr.upload(h_inRowPtr) ||
+      !d_inColInd.upload(h_inColInd) || !d_inWeights.upload(h_inWeights) ||
+      !d_changedFrom.upload(changedFrom) || !d_changedTo.upload(changedTo) ||
+      !d_insertHeads.upload(insertHeads) || !d_distances.upload(distances) ||
+      !d_parent.upload(parent)) {
+    cout << "Error: could not copy the graph to the GPU.\n";
+    return false;
   }
-  CUDA_CHECK(cudaMemcpy(d_inRowPtr, h_inRowPtr.data(),
-                        (numberOfNodes + 1) * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  if (inNnz > 0) {
-    CUDA_CHECK(cudaMemcpy(d_inColInd, h_inColInd.data(),
-                          inNnz * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_inWeights, h_inWeights.data(),
-                          inNnz * sizeof(long long), cudaMemcpyHostToDevice));
+  SospWorkspace workspace;
+  if (!workspace.reserve(numberOfNodes)) {
+    cout << "Error: could not allocate the GPU workspace.\n";
+    return false;
   }
-  CUDA_CHECK(cudaMemcpy(d_distances, distances.data(),
-                        numberOfNodes * sizeof(long long),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_parent, parent.data(), numberOfNodes * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  if (numChanged > 0) {
-    CUDA_CHECK(cudaMemcpy(d_changedFrom, changedFrom.data(),
-                          numChanged * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_changedTo, changedTo.data(),
-                          numChanged * sizeof(int), cudaMemcpyHostToDevice));
-  }
-  if (numInsertHeads > 0) {
-    CUDA_CHECK(cudaMemcpy(d_insertHeads, insertHeads.data(),
-                          numInsertHeads * sizeof(int),
-                          cudaMemcpyHostToDevice));
-  }
+  const int numberOfEdges = static_cast<int>(h_outColInd.size());
+  DeviceCsr outCsr;
+  outCsr.numberOfNodes = numberOfNodes;
+  outCsr.numberOfEdges = numberOfEdges;
+  outCsr.rowPtr = d_outRowPtr.data();
+  outCsr.colInd = d_outColInd.data();
+  outCsr.weights = d_outWeights.data();
+  DeviceCsr inCsr = outCsr;
+  inCsr.rowPtr = d_inRowPtr.data();
+  inCsr.colInd = d_inColInd.data();
+  inCsr.weights = d_inWeights.data();
+  DeviceChanges changes;
+  changes.changedFrom = d_changedFrom.data();
+  changes.changedTo = d_changedTo.data();
+  changes.numberOfChanged = static_cast<int>(changedFrom.size());
+  changes.insertHeads = d_insertHeads.data();
+  changes.numberOfInsertHeads = static_cast<int>(insertHeads.size());
   uploadStage.stop();
 
-  const int BLOCK_SIZE = 256;
-  auto blocks = [&](int work) {
-    return (max(work, 1) + BLOCK_SIZE - 1) / BLOCK_SIZE;
-  };
-
   // ========================================================================
-  // STEP 1: ROOTS, SUBTREE INVALIDATION AND FIRST CANDIDATES (GPU)
+  // STEPS 1 AND 2 ON THE GPU (see sospUpdateGpu.cu)
   // ========================================================================
-  ScopedStage step1Stage("sosp/1_invalidate_gpu", true);
-  CUDA_CHECK(cudaMemset(d_invalid, 0, numberOfNodes * sizeof(int)));
-  CUDA_CHECK(cudaMemset(d_isAffected, 0, numberOfNodes * sizeof(int)));
-  CUDA_CHECK(cudaMemset(d_isCandidate, 0, numberOfNodes * sizeof(int)));
-  CUDA_CHECK(cudaMemset(d_candidateCount, 0, sizeof(int)));
-  if (numChanged > 0) {
-    markRootsKernel<<<blocks(numChanged), BLOCK_SIZE>>>(
-        d_changedFrom, d_changedTo, numChanged, d_parent, d_invalid);
-    CUDA_CHECK(cudaGetLastError());
-
-    // ceil(log2 n) rounds: the jump distance doubles every round.
-    int rounds = 0;
-    while ((1LL << rounds) < numberOfNodes) {
-      ++rounds;
-    }
-    initAncestorsKernel<<<blocks(numberOfNodes), BLOCK_SIZE>>>(
-        numberOfNodes, d_parent, d_ancestor);
-    for (int r = 0; r < rounds; ++r) {
-      pointerJumpKernel<<<blocks(numberOfNodes), BLOCK_SIZE>>>(
-          numberOfNodes, d_ancestor, d_invalid);
-    }
-    CUDA_CHECK(cudaGetLastError());
-    invalidateKernel<<<blocks(numberOfNodes), BLOCK_SIZE>>>(
-        numberOfNodes, d_invalid, d_distances, d_parent, d_isCandidate,
-        d_candidateList, d_candidateCount, INF_VALUE);
-    CUDA_CHECK(cudaGetLastError());
-  }
-  int h_invalidated = 0;
-  CUDA_CHECK(cudaMemcpy(&h_invalidated, d_candidateCount, sizeof(int),
-                        cudaMemcpyDeviceToHost));
-  recordCounter("sosp/invalidated", h_invalidated);
-  if (numInsertHeads > 0) {
-    addCandidatesKernel<<<blocks(numInsertHeads), BLOCK_SIZE>>>(
-        d_insertHeads, numInsertHeads, source, d_isCandidate, d_candidateList,
-        d_candidateCount);
-    CUDA_CHECK(cudaGetLastError());
-  }
-  int h_candidateCount = 0;
-  CUDA_CHECK(cudaMemcpy(&h_candidateCount, d_candidateCount, sizeof(int),
-                        cudaMemcpyDeviceToHost));
-
-  // First pull pass: every candidate takes its best valid in-neighbour.
-  int h_affectedCount = 0;
-  CUDA_CHECK(cudaMemset(d_affectedCount, 0, sizeof(int)));
-  if (h_candidateCount > 0) {
-    updateDistancesKernel<<<blocks(h_candidateCount), BLOCK_SIZE>>>(
-        d_candidateList, h_candidateCount, d_inRowPtr, d_inColInd, d_inWeights,
-        d_distances, d_parent, d_isAffected, d_affectedList, d_affectedCount,
-        INF_VALUE);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaMemcpy(&h_affectedCount, d_affectedCount, sizeof(int),
-                          cudaMemcpyDeviceToHost));
-  }
-  step1Stage.stop();
-  recordCounter("sosp/initial_affected", h_affectedCount);
-
-  // ========================================================================
-  // STEP 2: PROPAGATE THE UPDATE (CUDA Kernels, monotone)
-  // ========================================================================
-  ScopedStage propagateStage("sosp/2c_propagate_gpu", true);
-  long long totalCandidates = 0;
-  int iterationCount = 0;
-
-  while (h_affectedCount > 0) {
-    ++iterationCount;
-    if (iterationCount > numberOfNodes) {
-      // Distances only decrease and every sweep settles at least one more
-      // hop of every shortest path, so this cannot happen.
-      cout << "Error: SOSP update did not converge.\n";
+  SospStats stats;
+  {
+    ScopedStage updateStage("sosp/update_gpu", true);
+    if (!sospUpdateGpu(outCsr, inCsr, changes, source, delta, maxWeight,
+                       workspace, d_distances.data(), d_parent.data(),
+                       &stats)) {
+      cout << "Error: SOSP update failed on the GPU.\n";
       return false;
     }
-
-    // Reset candidate structures
-    CUDA_CHECK(
-        cudaMemset(d_isCandidate, 0, numberOfNodes * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_candidateCount, 0, sizeof(int)));
-
-    // --- 2a. Collect candidates ---
-    collectCandidatesKernel<<<blocks(h_affectedCount), BLOCK_SIZE>>>(
-        d_affectedList, h_affectedCount, d_outRowPtr, d_outColInd,
-        d_isCandidate, d_candidateList, d_candidateCount, d_isAffected,
-        source);
-    CUDA_CHECK(cudaGetLastError());
-
-    // Get candidate count
-    CUDA_CHECK(cudaMemcpy(&h_candidateCount, d_candidateCount, sizeof(int),
-                          cudaMemcpyDeviceToHost));
-    totalCandidates += h_candidateCount;
-    if (h_candidateCount == 0)
-      break;
-
-    // Reset affected structures for next iteration
-    CUDA_CHECK(cudaMemset(d_affectedCount, 0, sizeof(int)));
-
-    // --- 2b. Update distances ---
-    updateDistancesKernel<<<blocks(h_candidateCount), BLOCK_SIZE>>>(
-        d_candidateList, h_candidateCount, d_inRowPtr, d_inColInd, d_inWeights,
-        d_distances, d_parent, d_isAffected, d_affectedList, d_affectedCount,
-        INF_VALUE);
-    CUDA_CHECK(cudaGetLastError());
-
-    // Get affected count for next iteration
-    CUDA_CHECK(cudaMemcpy(&h_affectedCount, d_affectedCount, sizeof(int),
-                          cudaMemcpyDeviceToHost));
   }
-  propagateStage.stop();
-  recordCounter("sosp/iterations", iterationCount);
-  recordCounter("sosp/candidates", totalCandidates);
+  recordCounter("sosp/invalidated", stats.invalidated);
+  recordCounter("sosp/iterations", stats.iterations);
+  recordCounter("sosp/epochs", stats.epochs);
+  recordCounter("sosp/pushes", stats.pushes);
 
   // ========================================================================
   // COPY RESULTS BACK TO HOST
   // ========================================================================
-  ScopedStage downloadStage("sosp/4_d2h_free", true);
-
-  CUDA_CHECK(cudaMemcpy(distances.data(), d_distances,
-                        numberOfNodes * sizeof(long long),
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(parent.data(), d_parent, numberOfNodes * sizeof(int),
-                        cudaMemcpyDeviceToHost));
-
-  // --- Free device memory ---
-  CUDA_CHECK(cudaFree(d_outRowPtr));
-  CUDA_CHECK(cudaFree(d_outColInd));
-  CUDA_CHECK(cudaFree(d_inRowPtr));
-  CUDA_CHECK(cudaFree(d_inColInd));
-  CUDA_CHECK(cudaFree(d_inWeights));
-  CUDA_CHECK(cudaFree(d_distances));
-  CUDA_CHECK(cudaFree(d_parent));
-  CUDA_CHECK(cudaFree(d_isAffected));
-  CUDA_CHECK(cudaFree(d_isCandidate));
-  CUDA_CHECK(cudaFree(d_affectedList));
-  CUDA_CHECK(cudaFree(d_candidateList));
-  CUDA_CHECK(cudaFree(d_affectedCount));
-  CUDA_CHECK(cudaFree(d_candidateCount));
-  CUDA_CHECK(cudaFree(d_invalid));
-  CUDA_CHECK(cudaFree(d_ancestor));
-  CUDA_CHECK(cudaFree(d_changedFrom));
-  CUDA_CHECK(cudaFree(d_changedTo));
-  CUDA_CHECK(cudaFree(d_insertHeads));
-
+  ScopedStage downloadStage("sosp/4_d2h", true);
+  if (!d_distances.download(distances) || !d_parent.download(parent)) {
+    cout << "Error: could not copy the result from the GPU.\n";
+    return false;
+  }
   downloadStage.stop();
 
   // ========================================================================
