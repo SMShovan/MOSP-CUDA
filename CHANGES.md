@@ -255,7 +255,9 @@ road_usa) and the remaining 64 - b bits for distances. Instead of a fixed
 (n - 1) x maxWeight does not fit, the search keeps 64-bit distances only and
 recovers the lowest-id parent in one pass over the out-edges afterwards
 (sm_86 has no 128-bit atomics). Tested with weights up to 2^31 - 1 on a
-320 x 320 grid (`mospTest --only large-weights`).
+320 x 320 grid, and with every weight 2 * 10^9 so that most vertices have
+two tight parents and the recovery must pick the lower id
+(`mospTest --only large-weights`).
 
 ### H-M1 / H-M2: in-memory pipeline (70d3105, 0c3dcc8, c0baba8)
 

@@ -56,7 +56,9 @@ make test TEST_SEED=0       # random seed for the stress tests (printed)
   and a host reference of the combined graph (default and skewed Pref).
   Also: the worked example of the thesis (Ch. 4, "Finding a single MOSP"),
   count-to-infinity regressions, the distance-only fallback for large
-  weights, generator and batch-application equivalence checks.
+  weights (random weights, and equal weights whose many ties exercise the
+  lowest-id parent recovery), generator and batch-application equivalence
+  checks.
 
 ## Running on real graphs
 
