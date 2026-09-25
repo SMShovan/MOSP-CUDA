@@ -85,7 +85,9 @@ bin/mosp --graph $G/csr/graphCsr --changes $G/changes --init $G/init --out outpu
 ```
 
 `bench/prepare.sh` wraps the preparation and `bench/run.sh` repeats runs
-(optionally under a GPU lock) and reports medians.
+(optionally under a GPU lock) and reports medians. `bench/baseline/` builds
+and runs the original code (`baseline-2026-09`) with stage timers on the
+same inputs, for the "original" columns of the results.
 
 ### bin/mosp
 

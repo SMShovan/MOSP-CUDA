@@ -1,0 +1,328 @@
+--- a/src/parallelSOSPUpdate.cu
++++ b/src/parallelSOSPUpdate.cu
+@@ -41,6 +41,7 @@
+ #include "parallelSOSPUpdate.cuh"
+ 
+ #include "read.cuh"
++#include "prof.cuh"
+ 
+ #include <cuda_runtime.h>
+ 
+@@ -257,6 +258,8 @@
+ // HOST HELPER FUNCTIONS
+ // ============================================================================
+ 
++
++
+ namespace {
+ 
+ /// A lightweight edge structure for the internal adjacency lists.
+@@ -457,6 +460,9 @@
+                         int source, const string &distancesOutputPath,
+                         const string &treeOutputPath) {
+   const long long INF_VALUE = numeric_limits<long long>::max() / 4;
++  const std::string PP = profPrefix();
++  StageTimer st(PP + "sosp/");
++  st.begin("0a_read_csr_text");
+ 
+   // ========================================================================
+   // PHASE 0: PREPARATION (Host — I/O dominated)
+@@ -487,11 +493,13 @@
+   }
+ 
+   // --- 0b. Build forward and reverse adjacency lists ---
++  st.begin("0b_build_adjlists_host");
+   vector<vector<WeightedNeighbor>> outAdjacency;
+   vector<vector<WeightedNeighbor>> inAdjacency;
+   buildAdjacencyLists(originalGraph, objectiveIndex, outAdjacency, inAdjacency);
+ 
+   originalGraph.clear();
++  st.begin("0c_read_dist_tree_text");
+ 
+   // --- 0c. Read original distances and parent arrays ---
+   vector<long long> distances;
+@@ -506,6 +514,7 @@
+   }
+ 
+   // --- 0d. Read inserted and deleted edges ---
++  st.begin("0d_read_changes_text");
+   struct InsertedEdge {
+     int from;
+     int to;
+@@ -561,6 +570,7 @@
+   }
+ 
+   // --- 0e. Apply topological changes to adjacency lists (Host) ---
++  st.begin("0e_apply_changes_adjlist_host");
+   struct WeightIncrease {
+     int from;
+     int to;
+@@ -607,6 +617,7 @@
+   // PHASE 1: PROCESS CHANGED EDGES (Host — tiny batch, order-dependent)
+   // ========================================================================
+ 
++  st.begin("1_process_changed_edges_host");
+   vector<int> isAffected(numberOfNodes, 0);
+   vector<int> affectedVertices;
+ 
+@@ -692,6 +703,11 @@
+   // ========================================================================
+ 
+   // --- Flatten adjacency lists to CSR for device transfer ---
++  profCounter(PP + "sosp/initial_affected") += affectedVertices.size();
++  profCounter(PP + "sosp/num_inserts") += insertedEdges.size();
++  profCounter(PP + "sosp/num_deletes") += deletedEdges.size();
++  profCounter(PP + "sosp/weight_increases") += weightIncreases.size();
++  st.begin("2a_flatten_to_csr_host");
+   vector<int> h_outRowPtr, h_outColInd;
+   vector<long long> h_outWeights;
+   flattenToCSR(outAdjacency, h_outRowPtr, h_outColInd, h_outWeights);
+@@ -708,6 +724,9 @@
+   int inNnz = static_cast<int>(h_inColInd.size());
+ 
+   // --- Allocate device memory ---
++  profCounter(PP + "sosp/nnz") += outNnz;
++  profCounter(PP + "sosp/n") += numberOfNodes;
++  st.begin("2b_cudaMalloc");
+   int *d_outRowPtr = nullptr, *d_outColInd = nullptr;
+   int *d_inRowPtr = nullptr, *d_inColInd = nullptr;
+   long long *d_inWeights = nullptr;
+@@ -731,7 +750,15 @@
+   CUDA_CHECK(cudaMalloc(&d_affectedCount, sizeof(int)));
+   CUDA_CHECK(cudaMalloc(&d_candidateCount, sizeof(int)));
+ 
++  {
++    size_t fr = 0, tt = 0;
++    cudaMemGetInfo(&fr, &tt);
++    double usedMB = (tt - fr) / 1048576.0;
++    double &mx = profCounter(PP + "sosp/max_gpu_used_MB_after_malloc");
++    if (usedMB > mx) mx = usedMB;
++  }
+   // --- Copy data to device ---
++  st.begin("2c_H2D_copy");
+   CUDA_CHECK(cudaMemcpy(d_outRowPtr, h_outRowPtr.data(),
+                         (numberOfNodes + 1) * sizeof(int),
+                         cudaMemcpyHostToDevice));
+@@ -766,6 +793,9 @@
+   }
+ 
+   // --- Iterative propagation loop ---
++  CUDA_CHECK(cudaDeviceSynchronize());
++  st.begin("2d_propagate_loop_gpu");
++  long long totCand = 0, totAff = 0, d2hSyncs = 0;
+   const int BLOCK_SIZE = 256;
+   int iterationCount = 0;
+   const int maxIterations = numberOfNodes;
+@@ -790,6 +820,8 @@
+     int h_candidateCount = 0;
+     CUDA_CHECK(cudaMemcpy(&h_candidateCount, d_candidateCount, sizeof(int),
+                           cudaMemcpyDeviceToHost));
++    ++d2hSyncs;
++    totCand += h_candidateCount;
+ 
+     if (h_candidateCount == 0)
+       break;
+@@ -808,7 +840,14 @@
+     // Get affected count for next iteration
+     CUDA_CHECK(cudaMemcpy(&h_affectedCount, d_affectedCount, sizeof(int),
+                           cudaMemcpyDeviceToHost));
++    ++d2hSyncs;
++    totAff += h_affectedCount;
+   }
++  CUDA_CHECK(cudaDeviceSynchronize());
++  profCounter(PP + "sosp/prop_iterations") += iterationCount;
++  profCounter(PP + "sosp/prop_total_candidates") += totCand;
++  profCounter(PP + "sosp/prop_total_affected") += totAff;
++  profCounter(PP + "sosp/prop_scalar_D2H_syncs") += d2hSyncs;
+ 
+   if (iterationCount >= maxIterations && h_affectedCount > 0) {
+     cout << "Warning: SOSP update reached maximum iteration limit ("
+@@ -819,6 +858,8 @@
+   // POST-PROCESSING: REACHABILITY CHECK (CUDA BFS)
+   // ========================================================================
+ 
++  st.begin("3_bfs_reachability_gpu");
++  long long bfsLevels = 0;
+   {
+     int *d_reachable = nullptr;
+     int *d_frontier = nullptr, *d_nextFrontier = nullptr;
+@@ -828,6 +869,7 @@
+     CUDA_CHECK(cudaMalloc(&d_frontier, numberOfNodes * sizeof(int)));
+     CUDA_CHECK(cudaMalloc(&d_nextFrontier, numberOfNodes * sizeof(int)));
+     CUDA_CHECK(cudaMalloc(&d_nextFrontierCount, sizeof(int)));
++    auto bt0 = std::chrono::steady_clock::now();
+ 
+     CUDA_CHECK(cudaMemset(d_reachable, 0, numberOfNodes * sizeof(int)));
+ 
+@@ -852,6 +894,7 @@
+ 
+       CUDA_CHECK(cudaMemcpy(&h_frontierSize, d_nextFrontierCount, sizeof(int),
+                             cudaMemcpyDeviceToHost));
++      ++bfsLevels;
+ 
+       // Swap frontier pointers
+       int *temp = d_frontier;
+@@ -859,21 +902,32 @@
+       d_nextFrontier = temp;
+     }
+ 
++    auto bt1 = std::chrono::steady_clock::now();
+     // Mark unreachable vertices
+     int gridSize = (numberOfNodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+     markUnreachableKernel<<<gridSize, BLOCK_SIZE>>>(
+         numberOfNodes, d_reachable, d_distances, d_parent, INF_VALUE);
+     CUDA_CHECK(cudaGetLastError());
+ 
++    CUDA_CHECK(cudaDeviceSynchronize());
++    auto bt2 = std::chrono::steady_clock::now();
+     CUDA_CHECK(cudaFree(d_reachable));
+     CUDA_CHECK(cudaFree(d_frontier));
+     CUDA_CHECK(cudaFree(d_nextFrontier));
+     CUDA_CHECK(cudaFree(d_nextFrontierCount));
++    auto bt3 = std::chrono::steady_clock::now();
++    auto msd = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
++    profCounter(PP + "sosp/bfs_us_loop") += 1000 * msd(bt0, bt1);
++    profCounter(PP + "sosp/bfs_us_mark") += 1000 * msd(bt1, bt2);
++    profCounter(PP + "sosp/bfs_us_free") += 1000 * msd(bt2, bt3);
+   }
+ 
+   // ========================================================================
+   // COPY RESULTS BACK TO HOST
+   // ========================================================================
++  CUDA_CHECK(cudaDeviceSynchronize());
++  profCounter(PP + "sosp/bfs_levels") += bfsLevels;
++  st.begin("4a_D2H_copy");
+ 
+   CUDA_CHECK(cudaMemcpy(distances.data(), d_distances,
+                         numberOfNodes * sizeof(long long),
+@@ -882,6 +936,7 @@
+                         cudaMemcpyDeviceToHost));
+ 
+   // --- Free device memory ---
++  st.begin("4b_cudaFree");
+   CUDA_CHECK(cudaFree(d_outRowPtr));
+   CUDA_CHECK(cudaFree(d_outColInd));
+   CUDA_CHECK(cudaFree(d_inRowPtr));
+@@ -899,6 +954,7 @@
+   // ========================================================================
+   // WRITE OUTPUT (Host — I/O)
+   // ========================================================================
++  st.begin("5_write_output_text");
+ 
+   filesystem::path distOutPath(distancesOutputPath);
+   if (!distOutPath.parent_path().empty()) {
+--- a/src/parallelCombinedGraph.cu
++++ b/src/parallelCombinedGraph.cu
+@@ -50,6 +50,7 @@
+ 
+ #include "parallelSOSPUpdate.cuh"
+ #include "read.cuh"
++#include "prof.cuh"
+ 
+ #include <filesystem>
+ #include <fstream>
+@@ -124,6 +125,9 @@
+   // ========================================================================
+ 
+   // --- 0a. Determine numberOfNodes from the CSR ---
++  const std::string PP0 = profPrefix();
++  StageTimer st(PP0 + "comb/");
++  st.begin("0a_read_full_csr_text_for_n");
+   Graph baseGraph;
+   int numberOfObjectives = 0;
+   if (!readCSR(originalCsrPrefix, baseGraph, numberOfObjectives)) {
+@@ -143,6 +147,7 @@
+   }
+ 
+   // --- 0b. Read K parent arrays ---
++  st.begin("0b_read_K_parent_files_text");
+   vector<vector<int>> parents(K);
+   for (int k = 0; k < K; ++k) {
+     if (!readParent(treeInputPaths[k], parents[k], numberOfNodes)) {
+@@ -158,6 +163,7 @@
+   // the tree edge is (parent_k[v] → v).
+   // We count how many trees each directed edge belongs to, then assign weight.
+ 
++  st.begin("1_membership_std_map_host");
+   map<pair<int, int>, int>
+       edgeMembership; // edge → count of trees it appears in
+ 
+@@ -178,6 +184,8 @@
+   // ========================================================================
+ 
+   // Create the work directory
++  profCounter(PP0 + "comb/combined_edges") += edgeMembership.size();
++  st.begin("2_write_temp_files_text");
+   filesystem::create_directories(workDir);
+ 
+   // --- 2a. Write EMPTY base CSR (same vertex count, zero edges) ---
+@@ -315,10 +323,14 @@
+        << " (" << edgeMembership.size() << " edges, " << numberOfNodes
+        << " vertices)...\n";
+ 
+-  if (!parallelSOSPUpdate(tempCsrPrefix, blankDistPath, blankTreePath,
++  st.end();
++  profPrefix() = PP0 + "comb/";
++  bool okSosp = parallelSOSPUpdate(tempCsrPrefix, blankDistPath, blankTreePath,
+                           insertPath, deletePath,
+                           /*objectiveIndex=*/0, source, distancesOutputPath,
+-                          treeOutputPath)) {
++                          treeOutputPath);
++  profPrefix() = PP0;
++  if (!okSosp) {
+     cout << "Error: parallelSOSPUpdate failed on combined graph.\n";
+     return false;
+   }
+--- a/src/sequentialSOSPUpdate.cu
++++ b/src/sequentialSOSPUpdate.cu
+@@ -64,6 +64,7 @@
+ #include "sequentialSOSPUpdate.cuh"
+ 
+ #include "read.cuh"
++#include "prof.cuh"
+ 
+ #include <filesystem>
+ #include <fstream>
+@@ -300,6 +301,9 @@
+     const string &treeOutputPath
+ ) {
+     const long long INF_VALUE = numeric_limits<long long>::max() / 4;
++    const std::string PP = profPrefix();
++    StageTimer st(PP + "seq/");
++    st.begin("0_prep_read_build_apply_host");
+ 
+     // ========================================================================
+     // PHASE 0: PREPARATION
+@@ -458,6 +462,7 @@
+     // Process insertions BEFORE deletions so that a newly inserted better path
+     // can protect a vertex from needing an alternative parent search.
+ 
++    st.begin("1_process_changed_edges_host");
+     vector<bool> isAffected(numberOfNodes, false);
+     vector<int> affectedVertices;
+ 
+@@ -562,6 +567,7 @@
+     //   (b) For each candidate, recompute the best distance from all in-neighbors.
+     //   (c) If the distance or parent changed, mark the candidate as affected.
+ 
++    st.begin("2_propagate_loop_seq");
+     int iterationCount = 0;
+     const int maxIterations = numberOfNodes; // Safety limit
+ 
+@@ -628,6 +634,8 @@
+     // a cycle). A BFS from the source on the updated graph identifies all
+     // reachable vertices. Unreachable vertices get dist = INF, parent = -1.
+ 
++    profCounter(PP + "seq/prop_iterations") += iterationCount;
++    st.begin("3_bfs_reachability_seq");
+     {
+         vector<bool> reachable(numberOfNodes, false);
+         queue<int> bfsQueue;
+@@ -657,6 +665,7 @@
+     // WRITE OUTPUT
+     // ========================================================================
+ 
++    st.begin("5_write_output_text");
+     // Create output directories if needed
+     filesystem::path distOutPath(distancesOutputPath);
+     if (!distOutPath.parent_path().empty()) {

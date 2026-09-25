@@ -20,8 +20,9 @@ Two scopes are reported everywhere:
 
 "Original" is `baseline-2026-09` with only the architecture fix (`sm_86`,
 host code at `-O0` as in the original Makefile); "original -O3" is the same
-code with host code at `-O3`. Medians of 3 runs on an RTX A5000 under an
-exclusive GPU lock; K = 3; 50K changes with 50% deletions.
+code with host code at `-O3`, both timed with the driver and stage timers in
+[bench/baseline/](bench/baseline/). Medians of 3 runs on an RTX A5000 under
+an exclusive GPU lock; K = 3; 50K changes with 50% deletions.
 
 ## Summary
 

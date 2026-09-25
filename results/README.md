@@ -37,8 +37,12 @@ optimizations are described in [CHANGES.md](../CHANGES.md).
   host code at `-O3`, driven by a thin harness that calls the original
   functions (K x `parallelSOSPUpdate`, then `parallelCombinedGraph`) on the
   same input files and adds stage timers with device synchronization at the
-  stage boundaries (`optimization_study/prototypes/mosp_kernel`,
-  `mospBench`).
+  stage boundaries: [bench/baseline/](../bench/baseline/) (`build.sh`
+  builds `mospBench_asis` and `mospBench_O3` from the tag plus
+  `stage-timers.patch`; `run.sh` reports the medians of (a) and (b) as
+  defined above). A re-run on roadNet-PA (50K safe, -O3, loaded host) gave
+  (a) 117 ms and (b) 20.3 s, all distances PASS, against the 113 ms and
+  19.4 s below.
 - **Inputs** (SuiteSparse): roadNet-PA (1.09M vertices, 3.08M directed
   edges), roadNet-CA (1.97M, 5.53M), rgg_n_2_20_s0 (1.05M, 13.8M), road_usa
   (23.9M, 57.7M); symmetric matrices get both edge directions; K = 3
@@ -137,8 +141,11 @@ because reading the 4-weight CSR dominates it.
 
 ## Ablation (roadNet-CA, K = 3; GPU work per step)
 
-Rows up to MP3 use the file-based driver of the respective commit (times of
-the GPU stages only), the last row the final `bin/mosp`. "Combined step" is
+Every row except the first is `bin/mosp` built at the listed commit and run
+with `--timing` (the sum of its GPU stages); rows up to MP3 predate the
+in-memory pipeline, so their driver still reads and writes the text files
+per step, which is not part of these times. The first row is the original
+code (`bench/baseline/`). "Combined step" is
 the GPU part of Steps 2-3 (for the original and the commits before MP3 only
 the SOSP on the combined graph; the host map is excluded).
 
