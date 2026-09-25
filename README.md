@@ -33,8 +33,9 @@ make OPT=                   # original flags: host code at -O0
 make NVCC=/usr/local/cuda/bin/nvcc
 ```
 
-Host code is compiled at `-O3` and everything with `-lineinfo`; header
-changes trigger rebuilds.
+Host code is compiled at `-O3` and everything with `-lineinfo`. Header
+changes trigger rebuilds, and so does a change of `NVCC`, `CUDA_ARCH` or
+`OPT` (every object is rebuilt; no `make clean` needed).
 
 ## Tests
 

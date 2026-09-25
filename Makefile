@@ -1,9 +1,11 @@
 # MOSPCUDA Makefile
 #
-#   make                      build bin/main (sm_86, host -O3, -lineinfo)
+#   make                      build bin/main, bin/mosp, bin/mospPrep and
+#                             bin/mospTest (sm_86, host -O3, -lineinfo)
 #   make CUDA_ARCH=sm_80      build for another GPU architecture
 #   make OPT=                 reproduce the original flags (host code at -O0)
 #   make NVCC=/path/to/nvcc   use a specific CUDA toolkit
+# Changing NVCC, CUDA_ARCH or OPT rebuilds every object (build/.flags).
 NVCC      ?= nvcc
 CUDA_ARCH ?= sm_86
 OPT       ?= -O3
@@ -13,6 +15,8 @@ DEPFLAGS  := -MMD -MP
 SRCDIR    := src
 BINDIR    := bin
 BUILDDIR  := build
+FLAGSTAMP := $(BUILDDIR)/.flags
+BUILDFLAGS = $(NVCC) $(CXXFLAGS) $(NVFLAGS)
 
 APP      := $(BINDIR)/main
 
@@ -46,7 +50,7 @@ PREP_OBJS := $(PREP_SRCS:$(SRCDIR)/%.cu=$(BUILDDIR)/%.o)
 MOSP_SRCS := $(SRCDIR)/mosp.cu $(BASE_SRCS) $(SRCDIR)/sequentialSOSPUpdate.cu $(SRCDIR)/parallelSOSPUpdate.cu $(SRCDIR)/parallelCombinedGraph.cu
 MOSP_OBJS := $(MOSP_SRCS:$(SRCDIR)/%.cu=$(BUILDDIR)/%.o)
 
-.PHONY: all clean run stressTest parallelStressTest test
+.PHONY: all clean run stressTest parallelStressTest test FORCE
 
 # Recipes use bash with pipefail so piped test output keeps the exit status.
 SHELL := /bin/bash
@@ -61,8 +65,16 @@ $(BINDIR) $(BUILDDIR):
 $(APP): $(MAIN_OBJS) | $(BINDIR)
 	$(NVCC) $(CXXFLAGS) $(NVFLAGS) -o $@ $^
 
-$(BUILDDIR)/%.o: $(SRCDIR)/%.cu | $(BUILDDIR)
+$(BUILDDIR)/%.o: $(SRCDIR)/%.cu $(FLAGSTAMP) | $(BUILDDIR)
 	$(NVCC) $(CXXFLAGS) $(NVFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+# The compiler and flags of the last build. The file is rewritten only when
+# they change, which makes every object out of date (objects built with
+# other flags are never mixed or reused).
+$(FLAGSTAMP): FORCE | $(BUILDDIR)
+	@echo '$(BUILDFLAGS)' | cmp -s - $@ || echo '$(BUILDFLAGS)' > $@
+
+FORCE:
 
 # --- Driver for prepared inputs ---
 $(BINDIR)/mosp: $(MOSP_OBJS) | $(BINDIR)
