@@ -62,6 +62,15 @@ make test TEST_SEED=0       # random seed for the stress tests (printed)
   weights (random weights, and equal weights whose many ties exercise the
   lowest-id parent recovery), generator and batch-application equivalence
   checks.
+- `scripts/endToEndTest.sh <binDir> <workDir> [seed]`: `bin/mospPrep`
+  and `bin/mosp` on a generated 900-vertex graph: `mtx2csr`, `init` and
+  `changes` (safe, disconnecting and targeted batches), then `mosp
+  --validate` on each, with the trees compared byte for byte with
+  `mospPrep expected` and `mospCosts.txt` checked; `--canonicalize` on
+  initial trees with the highest-id tie rule; `-k`/`--pref` with
+  `--cache` (written, then read) and the cache of `mospPrep cache`, whose
+  output must equal the text graph's; initial trees of another
+  `--source` must be rejected.
 
 ## Running on real graphs
 

@@ -101,12 +101,13 @@ $(BINDIR)/parallelStressTest: $(PARALLEL_STRESS_OBJS) | $(BINDIR)
 # --- Tests -------------------------------------------------------------------
 # Everything runs inside $(TESTDIR) so the repository stays clean.
 #   make test                 stock pipeline + 10 test cases + both stress
-#                             tests + the oracle suite (bin/mospTest)
+#                             tests + the oracle suite (bin/mospTest) +
+#                             bin/mospPrep and bin/mosp end to end
 #   make test TEST_SEED=0     stress tests with a random seed (printed)
 TESTDIR   := test-output
 TEST_SEED ?= 1
 
-test: $(APP) stressTest parallelStressTest $(BINDIR)/mospTest
+test: $(APP) stressTest parallelStressTest $(BINDIR)/mospTest $(BINDIR)/mosp $(BINDIR)/mospPrep
 	@rm -rf $(TESTDIR) && mkdir -p $(TESTDIR)
 	@echo "== bin/main (pipeline + 10 generated test cases)"
 	@cd $(TESTDIR) && ../$(APP) > main.log 2>&1 || { tail -n 30 main.log; exit 1; }
@@ -120,6 +121,9 @@ test: $(APP) stressTest parallelStressTest $(BINDIR)/mospTest
 	@echo "== bin/mospTest --seed $(TEST_SEED) (oracle suite: change sets, combined graph, thesis example)"
 	@$(BINDIR)/mospTest --seed $(TEST_SEED) --work $(TESTDIR)/mospTest > $(TESTDIR)/mospTest.log 2>&1 || { cat $(TESTDIR)/mospTest.log; exit 1; }
 	@tail -n 1 $(TESTDIR)/mospTest.log
+	@echo "== scripts/endToEndTest.sh (bin/mospPrep + bin/mosp: --validate, --canonicalize, --cache)"
+	@scripts/endToEndTest.sh $(BINDIR) $(TESTDIR)/endToEnd $(TEST_SEED) > $(TESTDIR)/endToEnd.out 2>&1 || { cat $(TESTDIR)/endToEnd.out; exit 1; }
+	@tail -n 1 $(TESTDIR)/endToEnd.out
 	@echo "== all tests passed"
 
 clean:
