@@ -46,7 +46,9 @@ make test TEST_SEED=0       # random seed for the stress tests (printed)
 - `bin/main`: the demo pipeline plus 10 generated test cases.
 - `bin/stressTest [seed] [runs]`, `bin/parallelStressTest [seed] [runs]`:
   100 random graphs each; distances *and* SSSP trees must equal Dijkstra.
-- `bin/mospTest [--seed S] [--only GROUP]`: oracle suite. Seeded random
+- `bin/mospTest [--seed S] [--work DIR] [--only GROUP]`: oracle suite
+  (inputs under DIR, default `mospTest-work`; a non-empty DIR that an
+  earlier run did not create is refused, not deleted). Seeded random
   graphs and road-like grids with every kind of batch (uniform
   connectivity-safe and disconnecting, deletions only, disconnecting
   deletions, insertions only, tree-edge weight increases, re-weighting,
@@ -65,10 +67,11 @@ make test TEST_SEED=0       # random seed for the stress tests (printed)
 `bin/mospPrep` prepares inputs, `bin/mosp` runs the MOSP update on them.
 
 ```
-bin/mospPrep mtx2csr roadNet-CA.mtx g/csr/graphCsr 3 1 100 12345  # K=3, w in [1,100]
-bin/mospPrep init g/csr/graphCsr g/init                           # initial trees
-bin/mospPrep changes g/csr/graphCsr g/changes --changes 50000 --ins 50 --seed 777 --safe
-bin/mosp --graph g/csr/graphCsr --changes g/changes --init g/init --out out --validate
+G=data/roadNet-CA   # data/ and output/ are ignored by git
+bin/mospPrep mtx2csr roadNet-CA.mtx $G/csr/graphCsr 3 1 100 12345  # K=3, w in [1,100]
+bin/mospPrep init $G/csr/graphCsr $G/init                          # initial trees
+bin/mospPrep changes $G/csr/graphCsr $G/changes --changes 50000 --ins 50 --seed 777 --safe
+bin/mosp --graph $G/csr/graphCsr --changes $G/changes --init $G/init --out output/roadNet-CA --validate
 ```
 
 `bench/prepare.sh` wraps the preparation and `bench/run.sh` repeats runs

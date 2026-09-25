@@ -1049,6 +1049,51 @@ void runApplyEquivalence(unsigned int seed) {
   cout << "apply: " << cases << " cases\n";
 }
 
+/// Marks a directory as mospTest's own work directory.
+const char *const kWorkMarker = ".mospTest-work";
+
+/// Empty the work directory, or create it, and mark it as ours. A
+/// directory that is not empty is only deleted if an earlier run marked
+/// it, so `--work .` or `--work ~` cannot wipe a checkout or a home
+/// directory.
+bool prepareWorkDirectory(const string &work) {
+  namespace fs = std::filesystem;
+  error_code ec;
+  const fs::path dir(work);
+  if (work.empty()) {
+    cerr << "Error: --work needs a directory.\n";
+    return false;
+  }
+  if (fs::exists(dir, ec)) {
+    if (!fs::is_directory(dir, ec)) {
+      cerr << "Error: --work " << work << " is not a directory.\n";
+      return false;
+    }
+    const bool empty = fs::is_empty(dir, ec);
+    const bool marked = fs::exists(dir / kWorkMarker, ec);
+    if (!empty && !marked) {
+      cerr << "Error: --work " << work
+           << " is not empty and was not created by mospTest; refusing to "
+              "delete it (choose a new or empty directory).\n";
+      return false;
+    }
+    fs::remove_all(dir, ec);
+    if (ec) {
+      cerr << "Error: could not empty --work " << work << ": "
+           << ec.message() << "\n";
+      return false;
+    }
+  }
+  fs::create_directories(dir, ec);
+  ofstream marker(dir / kWorkMarker);
+  if (ec || !marker) {
+    cerr << "Error: could not create --work " << work << "\n";
+    return false;
+  }
+  marker << "Work directory of mospTest; deleted by the next run.\n";
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1066,21 +1111,26 @@ int main(int argc, char **argv) {
       return 2;
     }
   }
+  if (!prepareWorkDirectory(g_work)) {
+    return 2;
+  }
   // Silence the chatty library calls; results are reported below.
   streambuf *saved = cout.rdbuf();
-  filesystem::remove_all(g_work);
   cout << "mospTest seed " << seed << "\n";
 
-  auto quiet = [&](const function<void(unsigned int)> &test) {
+  auto quiet = [&](const string &name,
+                   const function<void(unsigned int)> &test) {
     ostringstream sink;
     cout.rdbuf(sink.rdbuf());
+    streambuf *savedErr = cerr.rdbuf(sink.rdbuf()); // expected rejections
     test(seed);
     cout.rdbuf(saved);
-    // Forward summary and failure lines only.
+    cerr.rdbuf(savedErr);
+    // Forward the group's summary line ("<name>: ...") and failures only.
     istringstream lines(sink.str());
     string line;
     while (getline(lines, line)) {
-      if (line.rfind("  FAIL", 0) == 0 || line.find(" cases") != string::npos) {
+      if (line.rfind("  FAIL", 0) == 0 || line.rfind(name + ": ", 0) == 0) {
         cout << line << "\n";
       }
     }
@@ -1099,7 +1149,7 @@ int main(int argc, char **argv) {
   bool ran = false;
   for (const auto &group : groups) {
     if (only.empty() || only == group.first) {
-      quiet(group.second);
+      quiet(group.first, group.second);
       ran = true;
     }
   }

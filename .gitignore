@@ -10,6 +10,10 @@
 /parallelStressTest/
 /test-output/
 
+# Default output directories of bin/mosp and bin/mospTest
+/mosp-output/
+/mospTest-work/
+
 # Doxygen output
 /html/
 
@@ -18,3 +22,6 @@
 *.ncu-rep
 *.sqlite
 /bench-output/
+
+# macOS folder metadata
+.DS_Store
