@@ -226,11 +226,15 @@ open html/index.html
 
 ## References
 
-1. Shovan, Khanda, Das: "Parallel Multi Objective Shortest
+1. S. M. Shovan, A. Khanda, S. K. Das: "Parallel Multi-Objective Shortest
    Path Update Algorithm in Large Dynamic Networks", IEEE Transactions on
    Parallel and Distributed Systems (TPDS), 2025. The DynaMOSP algorithm
-   and its evaluation ("the paper").
-2. The thesis that describes the MOSP update of this code in Chapter 4
+   and its evaluation ("the paper"). Conference version: "DynaMOSP: A
+   Parallel Multi-Objective Shortest Path Update Algorithm for Fully Dynamic
+   Networks", IEEE IPDPS 2025.
+2. S. M. Shovan: "Parallel Algorithms and Data Structure for Large-Scale
+   Graph Analytics", PhD dissertation, Missouri University of Science and
+   Technology, 2026. Chapter 4 describes the MOSP update of this code
    (algorithm MOSP_Update, the combined graph with preference weights, the
    worked example "Finding a single MOSP" and the targeted workload of its
    performance section); cited as "the thesis" in the code and the docs.

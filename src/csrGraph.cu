@@ -565,6 +565,18 @@ bool loadCsrGraphBinary(const string &path, CsrGraph &graph,
             header[0] > 0 && header[1] > 0 && header[1] <= 32 &&
             numberOfEdges >= 0 && numberOfEdges <= INT_MAX;
   if (ok) {
+    // Check the header against the bytes that follow before allocating, so a
+    // damaged header cannot request a huge allocation.
+    std::error_code ec;
+    const uintmax_t fileSize = filesystem::file_size(path, ec);
+    const long position = ftell(file);
+    const uint64_t arrayBytes =
+        sizeof(int) * (static_cast<uint64_t>(header[0]) + 1 +
+                       static_cast<uint64_t>(numberOfEdges) * (1 + header[1]));
+    ok = !ec && position >= 0 &&
+         fileSize == static_cast<uintmax_t>(position) + arrayBytes;
+  }
+  if (ok) {
     graph.numberOfNodes = header[0];
     graph.numberOfObjectives = header[1];
     graph.rowPtr.resize(static_cast<size_t>(header[0]) + 1);
