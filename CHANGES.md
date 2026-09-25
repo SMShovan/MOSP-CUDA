@@ -161,6 +161,32 @@ ball) and `--safe` (drop deletions that disconnect a vertex).
   with `--canonicalize`; trees from other sources are checked for distances
   and parent consistency (3e03c0b).
 
+### Input checks and robustness (c46d831, 5a36122, cdce7bc, 5179cd9)
+
+- **Packed-word candidates.** The packed format is chosen when the bound
+  (n - 1) x maxWeight fits, which covers every stored distance but not a
+  candidate formed from one (a distance plus one more edge, up to
+  n x maxWeight). At the boundary such a candidate wrapped around in the
+  shifted word, won the `atomicMin` and left a wrong distance and a parent
+  cycle, silently. The pull pass and the push loop now drop candidates
+  above the bound (never shortest); `mospTest --only packing-boundary`
+  builds that case (n = 2^17 - 1, 47 distance bits).
+- **Input ranges.** Ids and offsets must be in [0, 2^31 - 1] and weights in
+  [1, 2^31 - 1] (CSR text files and insert.txt; before, values were
+  truncated to int and weights of 0 or below accepted: a negative insert
+  weight was read as about 2^64 by the GPU and made `--validate` loop).
+  Distance and tree files must list every vertex exactly once, distances
+  must not be negative, and the initial trees must be rooted at `--source`.
+  `mospPrep` checks K, 1 <= wmin <= wmax, the .mtx entry count and its
+  numeric options (it parsed them with `atoi`).
+- **Binary cache.** `--cache` used any cache newer than the text files. The
+  cache now records its source (text prefix, size and mtime of the three
+  files) and is rebuilt when they differ; its arrays get the checks of the
+  text reader.
+- Cost of the checks when reading road_usa (24M vertices): a distance file
+  takes 615 ms instead of 525 ms, a tree file 565 ms instead of 520 ms
+  (best of four; the files of all objectives are read concurrently).
+
 ## Performance
 
 ### Build (7711b5f)
@@ -293,11 +319,15 @@ written on the first run) reading drops from 0.27-5.25 s to 0.10-1.21 s and
 ## Tests
 
 - `make test`: stock pipeline + 10 test cases, both stress tests (seeded,
-  distances and trees must equal Dijkstra) and `bin/mospTest` (148 cases:
-  every batch kind on random graphs and road-like grids, file-based and
-  in-memory paths, Dijkstra and combined-graph references with default and
-  skewed Pref, determinism, thesis example, regressions, large-weight
-  fallback, generator/apply equivalence).
+  distances and trees must equal Dijkstra), `bin/mospTest` (sosp: 148
+  cases: every batch kind on random graphs and road-like grids, file-based
+  and in-memory paths, Dijkstra and combined-graph references with default
+  and skewed Pref, determinism; plus the thesis example, regressions, the
+  large-weight fallback with and without ties, the packing boundary, input
+  validation, the binary cache, generator/apply equivalence) and
+  `scripts/endToEndTest.sh` (`bin/mospPrep` and `bin/mosp` with
+  `--validate`, `--canonicalize`, `-k`, `--pref` and `--cache` on a
+  generated graph, compared with `mospPrep expected`).
 - Stress tests: 40 additional seeds (4,000 random cases per test) pass.
 - compute-sanitizer memcheck, initcheck, racecheck and synccheck are clean on
   the thesis example, the regression cases and the large-weight group of
@@ -307,6 +337,26 @@ written on the first run) reading drops from 0.27-5.25 s to 0.10-1.21 s and
   local batches, and on roadNet-CA with 4 objectives for K = 2 (Pref 1,3)
   and K = 4 (Pref 4,1,4,2): every tree and the MOSP tree identical to
   Dijkstra (distances and parents).
+
+## Corrections to commit messages
+
+The history was not rewritten (the commit ids are cited throughout this
+file), so two messages are corrected here:
+
+- 6b199db (MP2) gives, as the reason to drop the MP1 host loop, that the
+  persistent kernel was faster on every batch measured (roadNet-CA 50K:
+  8.3 vs 9.7 ms; 1K local weight changes: 9.0 vs 15.1 ms; road_usa 50K: 91
+  vs 98 ms per objective). Those numbers are from the earlier stand-alone
+  prototype, not from the kernel of that commit. The kernel committed in
+  6b199db was faster on small and local batches (roadNet-CA 10K local: 3.1
+  vs 5.2 ms per objective) but about 30% slower on 50K batches (roadNet-CA
+  50K safe: 12.8 vs 9.9 ms per objective, 7.45 vs 5.35 ms for the combined
+  step); 12e2c8d fixed the 50K slowdown (see MP2 and the ablation).
+- 12e2c8d puts that slowdown at "25-55%"; the ablation measures about 30%
+  per objective and 40% on the combined step (roadNet-CA 50K safe). It also
+  calls the local batch's 3.1 -> 3.4-3.9 ms "within noise"; it is a real
+  cost of 0.7 ms per objective (3.10 -> 3.82 ms), from the explicit
+  aggregation and the second barrier per iteration (see MP2).
 
 ## Behaviour changes
 
