@@ -5,7 +5,8 @@ Measurements of the `fix/correctness-perf` branch (`bin/mosp` built at
 optimizations are described in [CHANGES.md](../CHANGES.md).
 
 - **(a) GPU compute**: the GPU work of the K SOSP updates and of Steps 2-3
-  (combined graph + its SOSP), the region the papers time. For the original
+  (combined graph + its SOSP), the region timed in the DynaMOSP paper (see
+  References in ../README.md). For the original
   code: the GPU propagation loops plus the BFS post-passes of the K + 1 SOSP
   calls, without its host Step 1, the `cudaFree` stalls and the host
   `std::map` of the combined graph (listed separately where relevant). The

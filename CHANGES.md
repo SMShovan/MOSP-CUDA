@@ -6,7 +6,8 @@ Every commit builds and passes `make test`. Measurements: see
 
 Two scopes are reported everywhere:
 
-- **(a) GPU compute**: the region the papers time, i.e. the GPU work of the K
+- **(a) GPU compute**: the region timed in the DynaMOSP paper (see References
+  in README.md), i.e. the GPU work of the K
   SOSP updates and of Steps 2-3 of the MOSP update (combined graph + its SOSP).
   For the original code this is the GPU propagation loops plus the BFS
   post-passes of the K + 1 SOSP calls (without the `cudaFree` stalls inside
@@ -142,12 +143,11 @@ out, and sub-figure (d) labels u4 -> u5 with 3 where the formula gives 2.5
 ### M-e: seeded change generator (355ab67)
 
 `generateChangeBatch` / `bin/mospPrep changes`: `uniform` (identical to
-`generateChangedEdges` for the same seed; checked byte for byte against the
-study's roadNet-CA batch), `targeted` (thesis workload: below-average insert
+`generateChangedEdges` for the same seed; `mospTest --only generator`
+compares the two), `targeted` (thesis workload: below-average insert
 weights, deletions of distinct SOSP-tree edges), `reweight`, `increase`
 (weight increases on tree edges), `--local HOPS` (batch confined to a BFS
-ball) and `--safe` (drop deletions that disconnect a vertex; reproduces the
-study's "safe" sets byte for byte).
+ball) and `--safe` (drop deletions that disconnect a vertex).
 
 ### Smaller fixes
 
@@ -189,20 +189,21 @@ The whole update (pack, roots, pointer jumping, invalidation, pull,
 near-far loop, unpack) runs in one cooperative launch; all loop decisions
 are taken on the device (grid barriers), the host copies one control block
 at the end. Pointer jumping stops when no vertex is still jumping (bounded
-by ceil(log2 n) + 1 rounds; the prototype used a fixed 23, too few beyond
-2^23 tree depth). The MP1 host loop (one blocking copy per iteration) was
+by ceil(log2 n) + 1 rounds; a fixed round count such as 23 would be too
+few beyond 2^23 tree depth). The MP1 host loop (one blocking copy per iteration) was
 removed: besides being slower on small/local batches, it needs hundreds of
 host round trips per update and is fragile under contention (with the
-shared host overloaded and other processes on the same GPU, the study's
-host-loop prototype took 720 ms instead of 10 ms per objective on
-roadNet-CA, while its persistent version took 8.7 ms). CUDA-graph
+shared host overloaded and other processes on the same GPU, an earlier
+stand-alone host-loop prototype (not included) took 720 ms instead of 10 ms
+per objective on roadNet-CA, while its persistent version took 8.7 ms). CUDA-graph
 conditional nodes were not pursued (same device-side control, split over
 several kernels).
 
 The first version of MP2 (6b199db) was about 30-40% *slower* than MP1 on
 50K batches (roadNet-CA: 12.8 ms instead of 9.9 ms per objective, 7.5 ms instead
 of 5.35 ms for the combined step; up to 10 ms after MP3). Cause (found by
-bisecting against the study's prototype on an idle GPU, with Nsight
+bisecting against the persistent version of that stand-alone prototype,
+which did not have the slowdown, on an idle GPU, with Nsight
 Compute; it was neither the `__ldcg` loads, the number of grid barriers nor
 the occupancy): list appends were `atomicAdd` on a counter whose address
 rotated over three slots; nvcc warp-aggregates `atomicAdd` only when it can
@@ -213,8 +214,9 @@ threads), uses fixed near/next counters (thread 0 moves the count between
 two grid barriers), and replaces the two 64-bit totals that every thread of
 the combined-graph count kernel updated by a warp reduction.
 
-Ablation on roadNet-CA (K = 3; GPU work only; rows up to MP3 are the
-file-based driver of the respective commit, the last row `bin/mosp`):
+Ablation on roadNet-CA (K = 3; GPU work only; every row but the first is
+`bin/mosp` built at the listed commit, run with `--timing`; up to MP3 that
+driver still calls the file-based update):
 
 | step (commit) | 50K safe: update per objective | 50K safe: combined step (GPU) | 50K safe: (a) | 10K local: update per objective | 10K local: combined step (GPU) | 10K local: (a) |
 |---|---:|---:|---:|---:|---:|---:|
@@ -233,7 +235,7 @@ local batch it is 0.7 ms per objective slower than the first MP2 version:
 the explicit aggregation and the second barrier per iteration cost about 1
 us per iteration (the roadNet-CA local batch needs about 620 iterations per
 objective with little work each). The 50K batches were preferred as they are
-the papers' workload.
+the workload of the DynaMOSP paper (README.md, References).
 
 ### MP3: combined graph on the GPU (0d1d3ee)
 
@@ -313,15 +315,17 @@ written on the first run) reading drops from 0.27-5.25 s to 0.10-1.21 s and
   iterations and a BFS).
 - Combined-graph distances are in units of 1/L when a Pref vector is given.
 - `parallelCombinedGraph` no longer writes temporary files (`workDir` unused).
-- The GPU must support cooperative launches (Pascal or newer).
+- The GPU must support cooperative launches; with the CUDA 13 toolkit that
+  means Turing (sm_75) or newer (older GPUs would need CUDA 12, untested).
 - Weights must be positive integers (as before; now documented).
 
 ## Not done / deviations
 
-- The update-vs-recompute selector and a static near-far recompute baseline
-  (point 5) are parked as decided; `sospFromScratchGpu` exists only because
-  Step 3 needs it.
-- Provenance of the published numbers was not checked (as decided).
+- An update-vs-recompute selector and a static near-far recompute baseline
+  were out of scope; `sospFromScratchGpu` exists only because Step 3 needs
+  it.
+- The runtimes reported in the DynaMOSP paper were not re-derived; the
+  comparisons here are against the original code on the same inputs.
 - MP2 keeps one engine (the persistent kernel); CUDA-graph conditional nodes
   were not implemented, and the host-loop variant of MP1 was removed rather
   than kept as a tuned alternative.

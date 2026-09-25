@@ -18,8 +18,10 @@ measurements.
 
 ## Requirements
 
-- NVIDIA GPU with CUDA support and cooperative launch (Pascal or newer)
-- CUDA Toolkit (nvcc; CUDA 13 no longer supports sm_70)
+- NVIDIA GPU with cooperative launch support; with CUDA 13 (the tested
+  toolkit, whose oldest target is sm_75) that means Turing or newer.
+  Pascal and Volta would need CUDA 12 (untested).
+- CUDA Toolkit (nvcc)
 - C++17 compatible host compiler
 
 ## Build
@@ -57,7 +59,7 @@ make test TEST_SEED=0       # random seed for the stress tests (printed)
   in-memory pipeline, and checked against host Dijkstra (distances, parent
   consistency, identical canonical parents, identical output of two runs)
   and a host reference of the combined graph (default and skewed Pref).
-  Also: the worked example of the thesis (Ch. 4, "Finding a single MOSP"),
+  Also: the worked example of the thesis [2] (Ch. 4, "Finding a single MOSP"),
   count-to-infinity regressions, the distance-only fallback for large
   weights (random weights, and equal weights whose many ties exercise the
   lowest-id parent recovery), generator and batch-application equivalence
@@ -108,8 +110,8 @@ mosp --graph <csrPrefix> --changes <dir> --init <dir> [options]
 ```
 
 The summary line `RESULT gpu_compute_ms=<a> end_to_end_ms=<b>` reports
-(a) the GPU work of the K SOSP updates and of Steps 2-3 (the region the
-papers time) and (b) the wall time from reading the inputs to writing the
+(a) the GPU work of the K SOSP updates and of Steps 2-3 (the region timed
+in [1]) and (b) the wall time from reading the inputs to writing the
 outputs. Outputs: `obj<k>/distancesUpdated.txt`, `obj<k>/SSSPTreeUpdated.txt`,
 `combinedGraph/distancesCsr.txt` (in units of 1/L, L = lcm(Pref)),
 `combinedGraph/SSSPTreeCsr.txt`, `combinedGraph/mospCosts.txt` (the K
@@ -221,3 +223,14 @@ Open the HTML output:
 ```
 open html/index.html
 ```
+
+## References
+
+1. Shovan, Khanda, Das: "Parallel Multi Objective Shortest
+   Path Update Algorithm in Large Dynamic Networks", IEEE Transactions on
+   Parallel and Distributed Systems (TPDS), 2025. The DynaMOSP algorithm
+   and its evaluation ("the paper").
+2. The thesis that describes the MOSP update of this code in Chapter 4
+   (algorithm MOSP_Update, the combined graph with preference weights, the
+   worked example "Finding a single MOSP" and the targeted workload of its
+   performance section); cited as "the thesis" in the code and the docs.
